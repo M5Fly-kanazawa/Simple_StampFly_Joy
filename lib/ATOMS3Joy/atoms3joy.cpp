@@ -41,6 +41,7 @@ uint8_t MODE_BUTTON = RIGHT_BUTTON;
 uint8_t FLIP_BUTTON = LEFT_STICK_BUTTON;
 uint8_t OPTION_BUTTON = LEFT_BUTTON;
 
+uint16_t trim[4]={0,0,0,0};
 
 uint16_t read_2byte_data(uint8_t address)
 {
@@ -88,22 +89,15 @@ void get_max(uint8_t index){
 void get_min(uint8_t index){
     if (stick[index]<Stick_min[index])Stick_min[index]=stick[index];
 }
-uint8_t First_flag=51;
+
+uint8_t First_flag=0;
 void joy_update(void)
 {
     stick[RIGHTX] = read_2byte_data(RIGHT_STICK_X_ADDRESS);
     stick[RIGHTY] = read_2byte_data(RIGHT_STICK_Y_ADDRESS);
     stick[LEFTX] = read_2byte_data(LEFT_STICK_X_ADDRESS);
     stick[LEFTY] = read_2byte_data(LEFT_STICK_Y_ADDRESS);
-    if (First_flag>50){
-        First_flag = 51;
-        for (uint8_t i=0;i<4;i++){
-            get_max(i);
-            get_min(i);
-        }    
-    }
-    else First_flag++;
-
+    
     for (uint8_t i=0; i<4; i++)
     {
         button_old_state[i]=button_state[i];

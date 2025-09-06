@@ -53,10 +53,10 @@ esp_now_peer_info_t peerInfo;
 
 float Throttle;
 float Phi, Theta, Psi;
-uint16_t Phi_bias =2048;
-uint16_t Theta_bias = 2048;
-uint16_t Psi_bias =2048;
-uint16_t Throttle_bias = 2048;
+int16_t Phi_bias =0;
+int16_t Theta_bias = 0;
+int16_t Psi_bias =0;
+int16_t Throttle_bias = 0;
 short xstick=0;
 short ystick=0;
 uint8_t Mode=ANGLECONTROL;
@@ -90,6 +90,13 @@ void rc_init(void);
 void data_send(void);
 void show_battery_info();
 void voltage_print(void);
+
+float limit(float v, float vmin, float vmax)
+{
+  if (v<vmin)v=vmin;
+  if (v>vmax)v=vmax;
+  return v;
+}
 
 // 受信コールバック
 void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len) 
@@ -476,12 +483,12 @@ uint8_t check_alt_mode_change(void)
 }
 
 
-
+uint8_t average_counter = 0;
 void loop() {
-  uint16_t _throttle;// = getThrottle();
-  uint16_t _phi;// = getAileron();
-  uint16_t _theta;// = getElevator();
-  uint16_t _psi;// = getRudder();
+  int16_t _throttle;// = getThrottle();
+  int16_t _phi;// = getAileron();
+  int16_t _theta;// = getElevator();
+  int16_t _psi;// = getRudder();
   static uint8_t loop_counter = 0;
 
 
@@ -536,27 +543,49 @@ void loop() {
   _psi = getRudder();
 
 
-  if(getArmButton()==1)
+  if(average_counter<50)
   {
-    //Throttle_bias = _throttle;
-    Phi_bias = _phi;
-    Theta_bias = _theta;
-    Psi_bias = _psi;
+    average_counter++;
+    Throttle_bias += (_throttle - 2048);
+    Phi_bias += (_phi - 2048);
+    Theta_bias += (_theta - 2048);
+    Psi_bias += (_psi - 2048);
+  }
+  else if (average_counter==50)
+  {
+    average_counter++;
+    Throttle_bias = Throttle_bias/50;
+    Phi_bias = Phi_bias/50;
+    Theta_bias = Theta_bias/50;
+    Psi_bias = Psi_bias/50;
+    average_counter=51;
+  }
+  else
+  {
+    _throttle -= Throttle_bias;
+    _phi -= Phi_bias;
+    _theta -= Theta_bias;
+    _psi -= Psi_bias;
   }
 
   //量産版
-  Throttle = -(float)(_throttle - Throttle_bias)/(float)(RESO10BIT*0.5);
-  Phi =       (float)(_phi - Phi_bias)/(float)(RESO10BIT*0.5); 
-  Theta =     (float)(_theta - Theta_bias)/(float)(RESO10BIT*0.5);
-  Psi =       (float)(_psi - Psi_bias)/(float)(RESO10BIT*0.5);
+  Throttle = -(float)(_throttle - 2048)/(float)(RESO10BIT*0.5);
+  Phi =       (float)(_phi - 2048)/(float)(RESO10BIT*0.5); 
+  Theta =     (float)(_theta - 2048)/(float)(RESO10BIT*0.5);
+  Psi =       (float)(_psi - 2048)/(float)(RESO10BIT*0.5);
 
   //最終試作版
   #if 0
-  Throttle = (float)(_throttle - Throttle_bias)/(float)(RESO10BIT*0.5);
-  Phi =      (float)(_phi - Phi_bias)/(float)(RESO10BIT*0.5); 
-  Theta =   -(float)(_theta - Theta_bias)/(float)(RESO10BIT*0.5);
-  Psi =      (float)(_psi - Psi_bias)/(float)(RESO10BIT*0.5);
+  Throttle = (float)(_throttle - 2048)/(float)(RESO10BIT*0.5);
+  Phi =      (float)(_phi - 2048)/(float)(RESO10BIT*0.5); 
+  Theta =   -(float)(_theta - 2048)/(float)(RESO10BIT*0.5);
+  Psi =      (float)(_psi - 2048)/(float)(RESO10BIT*0.5);
   #endif
+
+  Throttle = limit(Throttle, -1.0, 1.0);
+  Phi = limit(Phi, -1.0, 1.0);
+  Theta = limit(Theta, -1.0, 1.0);
+  Psi = limit(Psi, -1.0, 1.0);
 
 
   uint8_t* d_int;
