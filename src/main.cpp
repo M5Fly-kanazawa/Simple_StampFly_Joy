@@ -387,7 +387,7 @@ void setup() {
     OPTION_BUTTON = LEFT_BUTTON;
   }
 
-  byte error, address;
+  uint8_t error, address;
   int nDevices;
 
 ////////////////////////////////////////////////////////
