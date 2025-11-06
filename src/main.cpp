@@ -44,15 +44,15 @@
 #define RATECONTROL 1
 #define ANGLECONTROL_W_LOG 2
 #define RATECONTROL_W_LOG 3
-#define ALT_CONTROL_MODE 4
-#define NOT_ALT_CONTROL_MODE 5
+#define ALT_CONTROL_MODE 1
+#define NOT_ALT_CONTROL_MODE 0
 #define RESO10BIT (4096)
 
 
 esp_now_peer_info_t peerInfo;
 
-float Throttle;
-float Phi, Theta, Psi;
+uint16_t Throttle;
+uint16_t Phi, Theta, Psi;
 int16_t Phi_bias =0;
 int16_t Theta_bias = 0;
 int16_t Psi_bias =0;
@@ -569,10 +569,16 @@ void loop() {
   }
 
   //量産版
-  Throttle = -(float)(_throttle - 2048)/(float)(RESO10BIT*0.5);
-  Phi =       (float)(_phi - 2048)/(float)(RESO10BIT*0.5); 
-  Theta =     (float)(_theta - 2048)/(float)(RESO10BIT*0.5);
-  Psi =       (float)(_psi - 2048)/(float)(RESO10BIT*0.5);
+  //Throttle = -(float)(_throttle - 2048)/(float)(RESO10BIT*0.5);
+  //Phi =       (float)(_phi - 2048)/(float)(RESO10BIT*0.5); 
+  //Theta =     (float)(_theta - 2048)/(float)(RESO10BIT*0.5);
+  //Psi =       (float)(_psi - 2048)/(float)(RESO10BIT*0.5);
+  Throttle = 4095 - _throttle;
+  Phi = _phi; 
+  Theta = _theta;
+  Psi = _psi;
+
+
 
   //最終試作版
   #if 0
@@ -582,10 +588,10 @@ void loop() {
   Psi =      (float)(_psi - 2048)/(float)(RESO10BIT*0.5);
   #endif
 
-  Throttle = limit(Throttle, -1.0, 1.0);
-  Phi = limit(Phi, -1.0, 1.0);
-  Theta = limit(Theta, -1.0, 1.0);
-  Psi = limit(Psi, -1.0, 1.0);
+  //Throttle = limit(Throttle, -1.0, 1.0);
+  //Phi = limit(Phi, -1.0, 1.0);
+  //Theta = limit(Theta, -1.0, 1.0);
+  //Psi = limit(Psi, -1.0, 1.0);
 
 
   uint8_t* d_int;
@@ -595,39 +601,32 @@ void loop() {
   senddata[1] = peerInfo.peer_addr[4];////////////////////////////
   senddata[2] = peerInfo.peer_addr[5];////////////////////////////
 
-  d_int = (uint8_t*)&Psi;
+  d_int = (uint8_t*)&Throttle;
   senddata[3]=d_int[0];
   senddata[4]=d_int[1];
-  senddata[5]=d_int[2];
-  senddata[6]=d_int[3];
-
-  d_int = (uint8_t*)&Throttle;
-  senddata[7]=d_int[0];
-  senddata[8]=d_int[1];
-  senddata[9]=d_int[2];
-  senddata[10]=d_int[3];
 
   d_int = (uint8_t*)&Phi;
-  senddata[11]=d_int[0];
-  senddata[12]=d_int[1];
-  senddata[13]=d_int[2];
-  senddata[14]=d_int[3];
+  senddata[5]=d_int[0];
+  senddata[6]=d_int[1];
 
   d_int = (uint8_t*)&Theta;
-  senddata[15]=d_int[0];
-  senddata[16]=d_int[1];
-  senddata[17]=d_int[2];
-  senddata[18]=d_int[3];
+  senddata[7]=d_int[0];
+  senddata[8]=d_int[1];
 
-  senddata[19]=getArmButton();
-  senddata[20]=getFlipButton();
-  senddata[21]=Mode;
-  senddata[22]=AltMode;
-  senddata[23]=proactive_flag;
+  d_int = (uint8_t*)&Psi;
+  senddata[9]=d_int[0];
+  senddata[10]=d_int[1];
+
+  senddata[11]=(0x01&AltMode)<<3|(0x01&Mode)<<2|(0x0001&getFlipButton())<<1|(0x0001&getArmButton());
+  //senddata[11]=getArmButton();
+  //senddata[12]=getFlipButton();
+  //senddata[13]=Mode;
+  //senddata[14]=AltMode;
+  senddata[12]=proactive_flag;
   
   //checksum
-  senddata[24]=0;
-  for(uint8_t i=0;i<24;i++)senddata[24]=senddata[24]+senddata[i];
+  senddata[13]=0;
+  for(uint8_t i=0;i<13;i++)senddata[13]=senddata[13]+senddata[i];
   
   //送信
   esp_err_t result = esp_now_send(peerInfo.peer_addr, senddata, sizeof(senddata));
