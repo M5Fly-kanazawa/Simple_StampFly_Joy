@@ -86,6 +86,11 @@ uint8_t Ch_counter;
 volatile uint8_t Received_flag = 0;
 volatile uint8_t Channel = CHANNEL;
 
+//TDMA
+static esp_timer_handle_t beacon_timer;
+static SemaphoreHandle_t beacon_sem;
+static volatile uint32_t epoch_next_us;
+
 void rc_init(void);
 void data_send(void);
 void show_battery_info();
