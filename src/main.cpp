@@ -106,8 +106,8 @@ static volatile int32_t pll_error_us = 0;      // Phase error in microseconds
 static volatile int32_t pll_integral = 0;       // Integral term for PLL
 static const float PLL_KP = 0.1;                // Proportional gain
 static const float PLL_KI = 0.01;               // Integral gain
-static const int32_t PLL_ERROR_CLAMP = 1000;    // Max error for P term: ±1ms
-static const int32_t PLL_RESYNC_THRESHOLD = 5000; // Resync if error > 5ms
+static const int32_t PLL_ERROR_CLAMP = 500;     // Max error for P term: ±0.5ms (half slot)
+static const int32_t PLL_RESYNC_THRESHOLD = 800; // Resync if error > 0.8ms (80% of slot)
 static volatile bool first_beacon_received = false; // First beacon flag for slaves
 
 void rc_init(void);
