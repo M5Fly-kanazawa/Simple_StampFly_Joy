@@ -138,14 +138,15 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
   if (is_peering) {
     if (recv_data[7] == 0xaa && recv_data[8] == 0x55 && recv_data[9] == 0x16 && recv_data[10] == 0x88) {
         Received_flag = 1;
-        Channel       = recv_data[0];
+        // TDMA mode: Use manually configured CHANNEL, ignore drone's channel
+        // Channel = recv_data[0];  // Disabled for TDMA
         Addr2[0]      = recv_data[1];
         Addr2[1]      = recv_data[2];
         Addr2[2]      = recv_data[3];
         Addr2[3]      = recv_data[4];
         Addr2[4]      = recv_data[5];
         Addr2[5]      = recv_data[6];
-        USBSerial.printf("Receive !\n");
+        USBSerial.printf("Receive ! (Using CHANNEL=%d)\n", CHANNEL);
     }
   }
   else {
@@ -224,14 +225,15 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
 
 #define BUF_SIZE 128
 // EEPROMにデータを保存する
-void save_data(void) 
+void save_data(void)
 {
   SPIFFS.begin(true);
   /* CREATE FILE */
   File fp = SPIFFS.open("/peer_info.txt", FILE_WRITE); // 書き込み、存在すれば上書き
   char buf[BUF_SIZE + 1];
-  sprintf(buf, "%d,%02X,%02X,%02X,%02X,%02X,%02X", 
-          Channel, 
+  // TDMA mode: Always save CHANNEL define value (not variable Channel)
+  sprintf(buf, "%d,%02X,%02X,%02X,%02X,%02X,%02X",
+          CHANNEL,  // Use define value, not variable
           Addr2[0],
           Addr2[1],
           Addr2[2],
@@ -243,17 +245,17 @@ void save_data(void)
   SPIFFS.end();
 
   USBSerial.printf("Saved Data:%d,[%02X:%02X:%02X:%02X:%02X:%02X]",
-      Channel, 
+      CHANNEL,  // Use define value
       Addr2[0],
       Addr2[1],
       Addr2[2],
       Addr2[3],
       Addr2[4],
-      Addr2[5]);    
+      Addr2[5]);
 }
 
 // EEPROMからデータを読み出す
-void load_data(void) 
+void load_data(void)
 {
   SPIFFS.begin(true);
   File fp = SPIFFS.open("/peer_info.txt", FILE_READ);
@@ -261,22 +263,25 @@ void load_data(void)
   while (fp.read((uint8_t *)buf, BUF_SIZE) == BUF_SIZE)
   {
     //USBSerial.print(buf);
+    uint8_t saved_channel;  // Temporary variable for saved channel
     sscanf(buf,"%hhd,%hhX,%hhX,%hhX,%hhX,%hhX,%hhX",
-          &Channel, 
+          &saved_channel,  // Read but don't use for TDMA
           &Addr2[0],
           &Addr2[1],
           &Addr2[2],
           &Addr2[3],
           &Addr2[4],
-          &Addr2[5]);    
-    USBSerial.printf("%d,%02X,%02X,%02X,%02X,%02X,%02X\n\r",
-          Channel, 
+          &Addr2[5]);
+    // TDMA mode: Always use CHANNEL define, ignore saved channel
+    Channel = CHANNEL;
+    USBSerial.printf("Loaded MAC (using CHANNEL=%d): %02X:%02X:%02X:%02X:%02X:%02X\n\r",
+          CHANNEL,
           Addr2[0],
           Addr2[1],
           Addr2[2],
           Addr2[3],
           Addr2[4],
-          Addr2[5]);    
+          Addr2[5]);
   }
   fp.close();
   SPIFFS.end();
@@ -318,21 +323,19 @@ void peering(void)
   esp_now_register_recv_cb(OnDataRecv);
 
   //ペアリング
-  Ch_counter = 1;
+  // TDMA mode: Use only the manually configured CHANNEL
+  USBSerial.printf("TDMA: Using fixed channel %02d.\n\r", CHANNEL);
+  peerInfo.channel = CHANNEL;
+  peerInfo.encrypt = false;
+  while (esp_now_mod_peer(&peerInfo) != ESP_OK)
+  {
+      USBSerial.println("Failed to mod peer");
+  }
+  esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  //Wait receive StampFly MAC Address on the configured channel
   while(1)
   {
-    USBSerial.printf("Try channel %02d.\n\r", Ch_counter);
-    peerInfo.channel = Ch_counter;
-    peerInfo.encrypt = false;
-    while (esp_now_mod_peer(&peerInfo) != ESP_OK) 
-    {
-        USBSerial.println("Failed to mod peer");
-    }
-    esp_wifi_set_channel(Ch_counter, WIFI_SECOND_CHAN_NONE);
-
-    //Wait receive StampFly MAC Address
-    //uint32_t counter=1;
-    //Channelをひとつづつ試していく
     for (uint8_t i =0;i<100;i++)
     {
           break_flag = 0;
@@ -349,10 +352,9 @@ void peering(void)
     }
 
     if (break_flag)break;
-    Ch_counter++;
-    if(Ch_counter==15)Ch_counter=1;
   }
-  //Channel = Ch_counter;
+  // Force Channel to be CHANNEL define value
+  Channel = CHANNEL;
 
   save_data();
   is_peering = 0;
@@ -416,7 +418,7 @@ void setup() {
         break;
       }
     }
-    rc_init(1, Addr1);
+    rc_init(CHANNEL, Addr1);  // TDMA: Use CHANNEL define
     USBSerial.printf("Button pressed!\n\r");
     M5.Lcd.println(" ");
     M5.Lcd.println("Push StampFly");
@@ -425,7 +427,7 @@ void setup() {
     M5.Lcd.println("Pairing...");
     peering();
   }
-  else rc_init(Channel, Addr2);
+  else rc_init(CHANNEL, Addr2);  // TDMA: Use CHANNEL define
   M5.Lcd.fillScreen(BLACK);
   joy_update();
 
