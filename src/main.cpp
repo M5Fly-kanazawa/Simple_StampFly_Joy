@@ -93,6 +93,9 @@ uint8_t Ch_counter;
 volatile uint8_t Received_flag = 0;
 volatile uint8_t Channel = CHANNEL;
 
+// Loop synchronization (removed hw_timer, using TDMA semaphore only)
+// volatile uint8_t Loop_flag=0;  // Deprecated - use beacon_sem instead
+
 //TDMA
 static esp_timer_handle_t beacon_timer;
 static SemaphoreHandle_t beacon_sem;
@@ -390,13 +393,7 @@ void change_channel(uint8_t ch)
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
 }
 
-//周期カウンタ割り込み関数
-hw_timer_t * timer = NULL;
-void IRAM_ATTR onTimer() 
-{
-  Loop_flag = 1;
-  //Timer = Timer + dTime;
-}
+// hw_timer removed - using esp_timer (beacon_timer) for synchronization
 
 void setup() {
   M5.begin();
@@ -502,15 +499,7 @@ void setup() {
   esp_now_get_version(&espnow_version);
   USBSerial.printf("ESP-NOW Version %d\n", espnow_version);
 
-
-  //割り込み設定
-  timer = timerBegin(1, 80, true);
-  timerAttachInterrupt(timer, &onTimer, true);
-  timerAlarmWrite(timer, 10000, true);
-  timerAlarmEnable(timer);
-  delay(100);
-
-  // TDMA初期化
+  // TDMA初期化 (hw_timer removed - using esp_timer only)
   beacon_sem = xSemaphoreCreateBinary();
   if (beacon_sem == NULL) {
     USBSerial.println("Failed to create beacon semaphore");
@@ -531,17 +520,16 @@ void setup() {
   // Initialize epoch time
   epoch_next_us = esp_timer_get_time() + TDMA_FRAME_US;
 
-  // Start TDMA timer (for master device)
-  if (TDMA_DEVICE_ID == 0) {
-    // Master starts the timer immediately
-    err = esp_timer_start_periodic(beacon_timer, TDMA_FRAME_US);
-    if (err != ESP_OK) {
-      USBSerial.printf("Failed to start TDMA timer: %d\n", err);
-    } else {
-      USBSerial.printf("TDMA Master started (ID=%d)\n", TDMA_DEVICE_ID);
-    }
+  // Start TDMA timer (both master and slave use it for synchronization)
+  err = esp_timer_start_periodic(beacon_timer, TDMA_FRAME_US);
+  if (err != ESP_OK) {
+    USBSerial.printf("Failed to start TDMA timer: %d\n", err);
   } else {
-    USBSerial.printf("TDMA Slave initialized (ID=%d)\n", TDMA_DEVICE_ID);
+    if (TDMA_DEVICE_ID == 0) {
+      USBSerial.printf("TDMA Master started (ID=%d)\n", TDMA_DEVICE_ID);
+    } else {
+      USBSerial.printf("TDMA Slave started (ID=%d)\n", TDMA_DEVICE_ID);
+    }
   }
 }
 
@@ -602,12 +590,10 @@ void loop() {
   int16_t _psi;// = getRudder();
   static uint8_t loop_counter = 0;
 
-
-  while(Loop_flag==0);
-  Loop_flag = 0;
+  // Removed Loop_flag wait - synchronization now handled by TDMA semaphore
   etime = stime;
   stime = micros();
-  dtime = stime - etime;  
+  dtime = stime - etime;
   loop_counter++;
   M5.update();
   joy_update();
@@ -754,10 +740,21 @@ void loop() {
 
     // Calculate slot start time
     uint32_t slot_start_us = epoch_next_us - TDMA_BEACON_ADVANCE_US + (TDMA_DEVICE_ID * TDMA_SLOT_US);
+    uint32_t current_us = esp_timer_get_time();
 
-    // Wait until our slot
-    while (esp_timer_get_time() < slot_start_us) {
-      delayMicroseconds(10);
+    // Optimized wait: Use vTaskDelay for long waits, busy wait for precise timing
+    if (slot_start_us > current_us) {
+      int32_t wait_us = slot_start_us - current_us;
+
+      // If wait time > 500us, use vTaskDelay to save CPU
+      if (wait_us > 500) {
+        vTaskDelay(pdMS_TO_TICKS((wait_us - 200) / 1000));  // Sleep until 200us before slot
+      }
+
+      // Final precise timing with busy wait
+      while (esp_timer_get_time() < slot_start_us) {
+        // Busy wait for precise timing
+      }
     }
 
     // Send control data in our assigned slot
