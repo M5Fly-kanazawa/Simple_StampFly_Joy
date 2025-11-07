@@ -41,7 +41,7 @@
 #define CHANNEL 1
 
 // TDMA Settings
-#define TDMA_DEVICE_ID 0         // Device ID: 0=Master, 1-9=Slave (manual setting)
+#define TDMA_DEVICE_ID 1         // Device ID: 0=Master, 1-9=Slave (manual setting)
 #define TDMA_FRAME_US 10000      // 1 frame = 10ms
 #define TDMA_SLOT_US 1000        // 1 slot = 1ms
 #define TDMA_NUM_SLOTS 10        // 10 slots per frame
@@ -838,8 +838,13 @@ void loop() {
       break;
     case 6:
       //M5.Lcd.printf("Time:%7.2f",Timer);
-      M5.Lcd.printf("Freq:%4d  [%3d] ",1000000/dtime, loop_counter);
-
+      #if TDMA_DEVICE_ID == 0
+        // Master device - show frequency and role
+        M5.Lcd.printf("Freq:%4d M[%3d]", 1000000/dtime, loop_counter);
+      #else
+        // Slave device - show frequency and PLL sync error
+        M5.Lcd.printf("Freq:%4d E:%+4d", 1000000/dtime, (int)pll_error_us);
+      #endif
       break;
     case 7:
       break;
