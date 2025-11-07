@@ -40,6 +40,13 @@
 
 #define CHANNEL 1
 
+// TDMA Settings
+#define TDMA_DEVICE_ID 0         // Device ID: 0=Master, 1-9=Slave (manual setting)
+#define TDMA_FRAME_US 10000      // 1 frame = 10ms
+#define TDMA_SLOT_US 1000        // 1 slot = 1ms
+#define TDMA_NUM_SLOTS 10        // 10 slots per frame
+#define TDMA_BEACON_ADVANCE_US 250  // Beacon fires 250us before frame start
+
 #define ANGLECONTROL 0
 #define RATECONTROL 1
 #define ANGLECONTROL_W_LOG 2
@@ -91,10 +98,32 @@ static esp_timer_handle_t beacon_timer;
 static SemaphoreHandle_t beacon_sem;
 static volatile uint32_t epoch_next_us;
 
+// PLL for synchronization
+static volatile int32_t pll_error_us = 0;      // Phase error in microseconds
+static volatile int32_t pll_integral = 0;       // Integral term for PLL
+static const float PLL_KP = 0.1;                // Proportional gain
+static const float PLL_KI = 0.01;               // Integral gain
+
 void rc_init(void);
 void data_send(void);
 void show_battery_info();
 void voltage_print(void);
+
+// TDMA beacon timer callback
+void IRAM_ATTR beacon_timer_callback(void* arg)
+{
+    // Give semaphore to signal that it's time to send
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(beacon_sem, &xHigherPriorityTaskWoken);
+
+    // Calculate next epoch time with PLL correction
+    int32_t correction = (int32_t)(PLL_KP * pll_error_us + PLL_KI * pll_integral);
+    epoch_next_us = esp_timer_get_time() + TDMA_FRAME_US + TDMA_BEACON_ADVANCE_US - correction;
+
+    if (xHigherPriorityTaskWoken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
 
 float limit(float v, float vmin, float vmax)
 {
@@ -104,7 +133,7 @@ float limit(float v, float vmin, float vmax)
 }
 
 // 受信コールバック
-void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len) 
+void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
 {
   if (is_peering) {
     if (recv_data[7] == 0xaa && recv_data[8] == 0x55 && recv_data[9] == 0x16 && recv_data[10] == 0x88) {
@@ -120,6 +149,35 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
     }
   }
   else {
+    // Check if this is a beacon packet (for TDMA synchronization)
+    // Beacon: exactly 2 bytes with 0xBE 0xAC header
+    if (data_len == 2 && recv_data[0] == 0xBE && recv_data[1] == 0xAC) {
+      // Beacon packet detected
+      if (TDMA_DEVICE_ID != 0) {
+        // Slave device received beacon from master - update PLL
+        uint32_t current_time = esp_timer_get_time();
+        int32_t expected_time = epoch_next_us - TDMA_BEACON_ADVANCE_US;
+
+        // Calculate phase error
+        pll_error_us = current_time - expected_time;
+        pll_integral += pll_error_us;
+
+        // Limit integral term to prevent windup
+        if (pll_integral > 10000) pll_integral = 10000;
+        if (pll_integral < -10000) pll_integral = -10000;
+
+        // Update next epoch time
+        epoch_next_us = current_time + TDMA_FRAME_US;
+      }
+      // Master device ignores beacon (own echo-back)
+      return;
+    }
+
+    // Check minimum length for telemetry data
+    if (data_len < 2) {
+      return;  // Too short, ignore
+    }
+
     //データ受信時に実行したい内容をここに書く。
     float a;
     uint8_t *dummy;
@@ -131,21 +189,33 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
     dummy=(uint8_t*)&a;
     dummy[0]=recv_data[0];
     dummy[1]=recv_data[1];
+
+    // Filter out invalid packets
     if (dummy[0]==0xF4)return;
+    if (dummy[0]==0xBE && dummy[1]==0xAC)return;  // Double-check beacon filter
+
+    // Validate data length before processing telemetry
+    // Telemetry format: 2-byte header + N*4-byte floats
+    if ((data_len - offset) % 4 != 0 || data_len < (offset + 4)) {
+      // Invalid telemetry format, ignore
+      return;
+    }
+
     if ((dummy[0]==99)&&(dummy[1]==99))Serial.printf("#PID Gain P Ti Td Eta ");
-    USBSerial.printf("%d ",(data_len-2)/4);
-    for (uint8_t i=0; i<((data_len-offset)/4); i++)
+
+    uint8_t num_floats = (data_len-offset)/4;
+    USBSerial.printf("%d ", num_floats);
+
+    for (uint8_t i=0; i < num_floats; i++)
     {
-      dummy[0]=recv_data[i*4 + 0 + offset];
-      dummy[1]=recv_data[i*4 + 1 + offset];
-      dummy[2]=recv_data[i*4 + 2 + offset];
-      dummy[3]=recv_data[i*4 + 3 + offset];
-      if (i<((data_len-offset)/4)){
+      // Bounds check before accessing array
+      uint16_t base_idx = i*4 + offset;
+      if (base_idx + 3 < data_len) {
+        dummy[0]=recv_data[base_idx + 0];
+        dummy[1]=recv_data[base_idx + 1];
+        dummy[2]=recv_data[base_idx + 2];
+        dummy[3]=recv_data[base_idx + 3];
         USBSerial.printf("%9.4f ", a);
-        //USBSerial.printf("%02d ", i);
-      }
-      else {
-        //USBSerial.printf("%2d %2d %4d", dummy[0], dummy[1], dummy[2]+256*dummy[3]);
       }
     }
     USBSerial.printf("\r\n");
@@ -437,6 +507,40 @@ void setup() {
   timerAlarmWrite(timer, 10000, true);
   timerAlarmEnable(timer);
   delay(100);
+
+  // TDMA初期化
+  beacon_sem = xSemaphoreCreateBinary();
+  if (beacon_sem == NULL) {
+    USBSerial.println("Failed to create beacon semaphore");
+  }
+
+  // TDMA timer setup
+  esp_timer_create_args_t beacon_timer_args;
+  beacon_timer_args.callback = &beacon_timer_callback;
+  beacon_timer_args.arg = NULL;
+  beacon_timer_args.dispatch_method = ESP_TIMER_TASK;
+  beacon_timer_args.name = "beacon_timer";
+
+  esp_err_t err = esp_timer_create(&beacon_timer_args, &beacon_timer);
+  if (err != ESP_OK) {
+    USBSerial.printf("Failed to create TDMA timer: %d\n", err);
+  }
+
+  // Initialize epoch time
+  epoch_next_us = esp_timer_get_time() + TDMA_FRAME_US;
+
+  // Start TDMA timer (for master device)
+  if (TDMA_DEVICE_ID == 0) {
+    // Master starts the timer immediately
+    err = esp_timer_start_periodic(beacon_timer, TDMA_FRAME_US);
+    if (err != ESP_OK) {
+      USBSerial.printf("Failed to start TDMA timer: %d\n", err);
+    } else {
+      USBSerial.printf("TDMA Master started (ID=%d)\n", TDMA_DEVICE_ID);
+    }
+  } else {
+    USBSerial.printf("TDMA Slave initialized (ID=%d)\n", TDMA_DEVICE_ID);
+  }
 }
 
 uint8_t check_control_mode_change(void)
@@ -632,9 +736,34 @@ void loop() {
   //checksum
   senddata[13]=0;
   for(uint8_t i=0;i<13;i++)senddata[13]=senddata[13]+senddata[i];
-  
-  //送信
-  esp_err_t result = esp_now_send(peerInfo.peer_addr, senddata, sizeof(senddata));
+
+  // TDMA synchronized transmission
+  // Wait for beacon timer semaphore
+  if (xSemaphoreTake(beacon_sem, pdMS_TO_TICKS(20)) == pdTRUE) {
+    // Semaphore received - it's time to send
+
+    // Master device sends beacon first
+    if (TDMA_DEVICE_ID == 0) {
+      // Send beacon packet
+      uint8_t beacon_data[2] = {0xBE, 0xAC};  // Beacon marker
+      esp_now_send(peerInfo.peer_addr, beacon_data, sizeof(beacon_data));
+      delayMicroseconds(TDMA_BEACON_ADVANCE_US);  // Wait until frame start
+    }
+
+    // Calculate slot start time
+    uint32_t slot_start_us = epoch_next_us - TDMA_BEACON_ADVANCE_US + (TDMA_DEVICE_ID * TDMA_SLOT_US);
+
+    // Wait until our slot
+    while (esp_timer_get_time() < slot_start_us) {
+      delayMicroseconds(10);
+    }
+
+    // Send control data in our assigned slot
+    esp_err_t result = esp_now_send(peerInfo.peer_addr, senddata, sizeof(senddata));
+  } else {
+    // Timeout - send anyway (fallback for non-TDMA mode)
+    esp_err_t result = esp_now_send(peerInfo.peer_addr, senddata, sizeof(senddata));
+  }
   #ifdef DEBUG
   USBSerial.printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
     peerInfo.peer_addr[0],
