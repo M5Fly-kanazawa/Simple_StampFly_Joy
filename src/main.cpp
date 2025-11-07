@@ -742,18 +742,18 @@ void loop() {
     uint32_t slot_start_us = epoch_next_us - TDMA_BEACON_ADVANCE_US + (TDMA_DEVICE_ID * TDMA_SLOT_US);
     uint32_t current_us = esp_timer_get_time();
 
-    // Optimized wait: Use vTaskDelay for long waits, busy wait for precise timing
+    // Precise microsecond timing for TDMA slot synchronization
     if (slot_start_us > current_us) {
       int32_t wait_us = slot_start_us - current_us;
 
-      // If wait time > 500us, use vTaskDelay to save CPU
-      if (wait_us > 500) {
-        vTaskDelay(pdMS_TO_TICKS((wait_us - 200) / 1000));  // Sleep until 200us before slot
+      // If wait time > 20us, use delayMicroseconds for precise timing
+      if (wait_us > 20) {
+        delayMicroseconds(wait_us - 10);  // Wait until 10us before slot start
       }
 
       // Final precise timing with busy wait
       while (esp_timer_get_time() < slot_start_us) {
-        // Busy wait for precise timing
+        // Busy wait for ultimate precision
       }
     }
 
