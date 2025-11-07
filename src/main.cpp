@@ -201,8 +201,8 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
             if (pll_integral > 10000) pll_integral = 10000;
             if (pll_integral < -10000) pll_integral = -10000;
 
-            // Update next epoch time
-            epoch_next_us = current_time + TDMA_FRAME_US;
+            // DO NOT update epoch_next_us here - let beacon_timer_callback handle it with PLL correction
+            // The timer callback will apply the correction based on pll_error_us and pll_integral
           }
         }
       }
