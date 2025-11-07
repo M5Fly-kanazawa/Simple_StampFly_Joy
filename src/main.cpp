@@ -109,6 +109,8 @@ static const float PLL_KI = 0.01;               // Integral gain
 static const int32_t PLL_ERROR_CLAMP = 500;     // Max error for P term: ±0.5ms (half slot)
 static const int32_t PLL_RESYNC_THRESHOLD = 800; // Resync if error > 0.8ms (80% of slot)
 static volatile bool first_beacon_received = false; // First beacon flag for slaves
+static volatile uint32_t last_beacon_time_us = 0;   // Last beacon reception time
+static const uint32_t BEACON_TIMEOUT_US = 50000;    // 50ms = 5 frames
 
 void rc_init(void);
 void data_send(void);
@@ -173,6 +175,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
       if (TDMA_DEVICE_ID != 0) {
         // Slave device received beacon from master
         uint32_t current_time = esp_timer_get_time();
+        last_beacon_time_us = current_time;  // Update last beacon time
 
         if (!first_beacon_received) {
           // First beacon: Immediate synchronization without PLL
@@ -183,7 +186,8 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
           USBSerial.printf("First beacon sync at %u us\n", current_time);
         } else {
           // Subsequent beacons: Normal PLL operation
-          int32_t expected_time = epoch_next_us - TDMA_BEACON_ADVANCE_US;
+          // epoch_next_us already points to the beacon time (frame start - 250us)
+          int32_t expected_time = epoch_next_us;  // Fixed: Don't subtract BEACON_ADVANCE_US again
           pll_error_us = current_time - expected_time;
 
           // Check for large error - indicates lost sync
@@ -758,6 +762,20 @@ void loop() {
   senddata[13]=0;
   for(uint8_t i=0;i<13;i++)senddata[13]=senddata[13]+senddata[i];
 
+  // Check for beacon loss (slave only)
+  static uint32_t last_beep_time = 0;
+  if (TDMA_DEVICE_ID != 0 && first_beacon_received) {
+    uint32_t time_since_beacon = esp_timer_get_time() - last_beacon_time_us;
+    if (time_since_beacon > BEACON_TIMEOUT_US) {
+      // Beacon lost - beep every 500ms
+      uint32_t current_millis = millis();
+      if (current_millis - last_beep_time >= 500) {
+        beep();
+        last_beep_time = current_millis;
+      }
+    }
+  }
+
   // TDMA synchronized transmission
   // Wait for beacon timer semaphore
   if (xSemaphoreTake(beacon_sem, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -842,8 +860,17 @@ void loop() {
         // Master device - show frequency and role
         M5.Lcd.printf("Freq:%4d M[%3d]", 1000000/dtime, loop_counter);
       #else
-        // Slave device - show frequency and PLL sync error
-        M5.Lcd.printf("Freq:%4d E:%+4d", 1000000/dtime, (int)pll_error_us);
+        // Slave device - show frequency and PLL sync error or beacon loss
+        if (first_beacon_received) {
+          uint32_t time_since_beacon = esp_timer_get_time() - last_beacon_time_us;
+          if (time_since_beacon > BEACON_TIMEOUT_US) {
+            M5.Lcd.printf("Freq:%4d LOST!  ", 1000000/dtime);
+          } else {
+            M5.Lcd.printf("Freq:%4d E:%+4d", 1000000/dtime, (int)pll_error_us);
+          }
+        } else {
+          M5.Lcd.printf("Freq:%4d WAIT   ", 1000000/dtime);
+        }
       #endif
       break;
     case 7:
