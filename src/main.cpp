@@ -56,7 +56,8 @@
 #define RESO10BIT (4096)
 
 
-esp_now_peer_info_t peerInfo;
+esp_now_peer_info_t dronePeer; // Peer for drone communication
+esp_now_peer_info_t beaconPeer;  // Peer for beacon multicast
 
 uint16_t Throttle;
 uint16_t Phi, Theta, Psi;
@@ -82,11 +83,9 @@ uint8_t senddata[25];//19->22->23->24->25
 uint8_t disp_counter=0;
 
 //StampFly MAC ADDRESS
-//1 F4:12:FA:66:80:54 (Yellow)
-//2 F4:12:FA:66:77:A4
-uint8_t Addr1[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-uint8_t Addr2[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
+uint8_t Drone_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// Broadcast address for TDMA beacons
+uint8_t Beacon_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 //Channel
 uint8_t Ch_counter;
@@ -99,6 +98,7 @@ volatile uint8_t Channel = CHANNEL;
 //TDMA
 static esp_timer_handle_t beacon_timer;
 static SemaphoreHandle_t beacon_sem;
+static TaskHandle_t beacon_task_handle = NULL;  // Task for beacon transmission
 static volatile uint32_t epoch_next_us;
 
 // PLL for synchronization
@@ -112,18 +112,49 @@ static volatile bool first_beacon_received = false; // First beacon flag for sla
 static volatile uint32_t last_beacon_time_us = 0;   // Last beacon reception time
 static const uint32_t BEACON_TIMEOUT_US = 50000;    // 50ms = 5 frames
 
-void rc_init(void);
+void wifi_esp_now_init(void);
 void data_send(void);
 void show_battery_info();
 void voltage_print(void);
 
+// Beacon transmission task (for master only)
+// This task waits for notification from timer ISR and sends beacon
+void beacon_task(void* parameter)
+{
+    uint8_t beacon_data[2] = {0xBE, 0xAC};
+
+    while (1) {
+        // Wait for notification from timer ISR
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // Send beacon immediately upon notification
+        esp_err_t result = esp_now_send(beaconPeer.peer_addr, beacon_data, sizeof(beacon_data));
+
+        // Optional: Log first few beacon attempts for debugging
+        static uint8_t beacon_counter = 0;
+        if (beacon_counter < 10) {
+            beacon_counter++;
+            if (result == ESP_OK) {
+                USBSerial.printf("Beacon sent OK (task %d)\n", beacon_counter);
+            } else {
+                USBSerial.printf("Beacon failed: %d (task %d)\n", result, beacon_counter);
+            }
+        }
+    }
+}
+
 // TDMA beacon timer callback
+// Note: Cannot call esp_now_send() here - not ISR safe!
 void IRAM_ATTR beacon_timer_callback(void* arg)
 {
-    // Give semaphore to signal that it's time to send
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xSemaphoreGiveFromISR(beacon_sem, &xHigherPriorityTaskWoken);
 
+    // Master: Notify beacon task to send beacon immediately
+    if (TDMA_DEVICE_ID == 0 && beacon_task_handle != NULL) {
+        vTaskNotifyGiveFromISR(beacon_task_handle, &xHigherPriorityTaskWoken);
+    }
+
+    // Update epoch time for next frame
     if (TDMA_DEVICE_ID == 0) {
         // Master: No PLL correction needed, autonomous timing
         epoch_next_us = esp_timer_get_time() + TDMA_FRAME_US + TDMA_BEACON_ADVANCE_US;
@@ -137,6 +168,9 @@ void IRAM_ATTR beacon_timer_callback(void* arg)
         int32_t correction = (int32_t)(PLL_KP * clamped_error + PLL_KI * pll_integral);
         epoch_next_us = esp_timer_get_time() + TDMA_FRAME_US + TDMA_BEACON_ADVANCE_US - correction;
     }
+
+    // Give semaphore to signal that it's time to send control data
+    xSemaphoreGiveFromISR(beacon_sem, &xHigherPriorityTaskWoken);
 
     if (xHigherPriorityTaskWoken == pdTRUE) {
         portYIELD_FROM_ISR();
@@ -158,12 +192,12 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
         Received_flag = 1;
         // TDMA mode: Use manually configured CHANNEL, ignore drone's channel
         // Channel = recv_data[0];  // Disabled for TDMA
-        Addr2[0]      = recv_data[1];
-        Addr2[1]      = recv_data[2];
-        Addr2[2]      = recv_data[3];
-        Addr2[3]      = recv_data[4];
-        Addr2[4]      = recv_data[5];
-        Addr2[5]      = recv_data[6];
+        Drone_mac[0]      = recv_data[1];
+        Drone_mac[1]      = recv_data[2];
+        Drone_mac[2]      = recv_data[3];
+        Drone_mac[3]      = recv_data[4];
+        Drone_mac[4]      = recv_data[5];
+        Drone_mac[5]      = recv_data[6];
         USBSerial.printf("Receive ! (Using CHANNEL=%d)\n", CHANNEL);
     }
   }
@@ -172,6 +206,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
     // Beacon: exactly 2 bytes with 0xBE 0xAC header
     if (data_len == 2 && recv_data[0] == 0xBE && recv_data[1] == 0xAC) {
       // Beacon packet detected
+      USBSerial.printf("Beacon received (ID=%d)\n", TDMA_DEVICE_ID);
       if (TDMA_DEVICE_ID != 0) {
         // Slave device received beacon from master
         uint32_t current_time = esp_timer_get_time();
@@ -214,11 +249,13 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
       return;
     }
 
+    #if 0
+    //テレメトリーデータ受信
     // Check minimum length for telemetry data
     if (data_len < 2) {
       return;  // Too short, ignore
     }
-
+    
     //データ受信時に実行したい内容をここに書く。
     float a;
     uint8_t *dummy;
@@ -260,6 +297,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
       }
     }
     USBSerial.printf("\r\n");
+    #endif
   }
 }
 
@@ -274,24 +312,24 @@ void save_data(void)
   // TDMA mode: Always save CHANNEL define value (not variable Channel)
   sprintf(buf, "%d,%02X,%02X,%02X,%02X,%02X,%02X",
           CHANNEL,  // Use define value, not variable
-          Addr2[0],
-          Addr2[1],
-          Addr2[2],
-          Addr2[3],
-          Addr2[4],
-          Addr2[5]);
+          Drone_mac[0],
+          Drone_mac[1],
+          Drone_mac[2],
+          Drone_mac[3],
+          Drone_mac[4],
+          Drone_mac[5]);
   fp.write((uint8_t *)buf, BUF_SIZE);
   fp.close();
   SPIFFS.end();
 
   USBSerial.printf("Saved Data:%d,[%02X:%02X:%02X:%02X:%02X:%02X]",
       CHANNEL,  // Use define value
-      Addr2[0],
-      Addr2[1],
-      Addr2[2],
-      Addr2[3],
-      Addr2[4],
-      Addr2[5]);
+      Drone_mac[0],
+      Drone_mac[1],
+      Drone_mac[2],
+      Drone_mac[3],
+      Drone_mac[4],
+      Drone_mac[5]);
 }
 
 // EEPROMからデータを読み出す
@@ -306,28 +344,28 @@ void load_data(void)
     uint8_t saved_channel;  // Temporary variable for saved channel
     sscanf(buf,"%hhd,%hhX,%hhX,%hhX,%hhX,%hhX,%hhX",
           &saved_channel,  // Read but don't use for TDMA
-          &Addr2[0],
-          &Addr2[1],
-          &Addr2[2],
-          &Addr2[3],
-          &Addr2[4],
-          &Addr2[5]);
+          &Drone_mac[0],
+          &Drone_mac[1],
+          &Drone_mac[2],
+          &Drone_mac[3],
+          &Drone_mac[4],
+          &Drone_mac[5]);
     // TDMA mode: Always use CHANNEL define, ignore saved channel
     Channel = CHANNEL;
     USBSerial.printf("Loaded MAC (using CHANNEL=%d): %02X:%02X:%02X:%02X:%02X:%02X\n\r",
           CHANNEL,
-          Addr2[0],
-          Addr2[1],
-          Addr2[2],
-          Addr2[3],
-          Addr2[4],
-          Addr2[5]);
+          Drone_mac[0],
+          Drone_mac[1],
+          Drone_mac[2],
+          Drone_mac[3],
+          Drone_mac[4],
+          Drone_mac[5]);
   }
   fp.close();
   SPIFFS.end();
 }
 
-void rc_init(uint8_t ch, uint8_t* addr)
+void wifi_esp_now_init(void)
 {  
     // ESP-NOW初期化
     WiFi.mode(WIFI_STA);
@@ -340,16 +378,44 @@ void rc_init(uint8_t ch, uint8_t* addr)
         USBSerial.println("ESPNow Init Failed");
         ESP.restart();
     }
+  // ESP-NOWコールバック登録
+  esp_now_register_recv_cb(OnDataRecv);
 
-    memset(&peerInfo, 0, sizeof(peerInfo));
-    memcpy(peerInfo.peer_addr, addr, 6);
-    peerInfo.channel = ch;
-    peerInfo.encrypt = false;
+#if 0
+    memset(&dronePeer, 0, sizeof(dronePeer));
+    memcpy(dronePeer.peer_addr, addr, 6);
+    dronePeer.channel = ch;
+    dronePeer.encrypt = false;
     uint8_t peer_mac_addre;
-    while (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    while (esp_now_add_peer(&dronePeer) != ESP_OK) {
         USBSerial.println("Failed to add peer");
     }
     esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+#endif
+}
+
+void broadcast_beacon_init(void)
+{
+    memset(&beaconPeer, 0, sizeof(beaconPeer));
+    memcpy(beaconPeer.peer_addr, Beacon_mac, 6);
+    beaconPeer.channel = CHANNEL;
+    beaconPeer.encrypt = false;
+    while (esp_now_add_peer(&beaconPeer) != ESP_OK) {
+        USBSerial.println("Failed to add beacon peer");
+    }
+    esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+}
+
+void drone_peer_init(void)
+{
+    memset(&dronePeer, 0, sizeof(dronePeer));
+    memcpy(dronePeer.peer_addr, Drone_mac, 6);
+    dronePeer.channel = CHANNEL;
+    dronePeer.encrypt = false;
+    while (esp_now_add_peer(&dronePeer) != ESP_OK) {
+        USBSerial.println("Failed to add drone peer");
+    }
+    esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
 }
 
 void peering(void)
@@ -359,19 +425,20 @@ void peering(void)
   //StampFlyはMACアドレスをFF:FF:FF:FF:FF:FFとして
   //StampFlyのMACアドレスをでブロードキャストする
   //その際にChannelが機体と送信機で同一でない場合は受け取れない
-  // ESP-NOWコールバック登録
-  esp_now_register_recv_cb(OnDataRecv);
+  
 
-  //ペアリング
+  //ピアリング
   // TDMA mode: Use only the manually configured CHANNEL
   USBSerial.printf("TDMA: Using fixed channel %02d.\n\r", CHANNEL);
-  peerInfo.channel = CHANNEL;
-  peerInfo.encrypt = false;
-  while (esp_now_mod_peer(&peerInfo) != ESP_OK)
+  dronePeer.channel = CHANNEL;
+  dronePeer.encrypt = false;
+  #if 0
+  while (esp_now_mod_peer(&dronePeer) != ESP_OK)
   {
       USBSerial.println("Failed to mod peer");
   }
   esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+  #endif
 
   //Wait receive StampFly MAC Address on the configured channel
   while(1)
@@ -399,30 +466,32 @@ void peering(void)
   save_data();
   is_peering = 0;
   USBSerial.printf("Channel:%02d\n\r", Channel);
-  USBSerial.printf("MAC2:%02X:%02X:%02X:%02X:%02X:%02X:\n\r",
-                    Addr2[0],Addr2[1],Addr2[2],Addr2[3],Addr2[4],Addr2[5]);
-  USBSerial.printf("MAC1:%02X:%02X:%02X:%02X:%02X:%02X:\n\r",
-                    Addr1[0],Addr1[1],Addr1[2],Addr1[3],Addr1[4],Addr1[5]);
+  USBSerial.printf("StampFly MAC:%02X:%02X:%02X:%02X:%02X:%02X:\n\r",
+                    Drone_mac[0],Drone_mac[1],Drone_mac[2],Drone_mac[3],Drone_mac[4],Drone_mac[5]);
+  //USBSerial.printf("MAC1:%02X:%02X:%02X:%02X:%02X:%02X:\n\r",
+  //                  Addr1[0],Addr1[1],Addr1[2],Addr1[3],Addr1[4],Addr1[5]);
 
   //Peering
-  while (esp_now_del_peer(Addr1) != ESP_OK) {
-    Serial.println("Failed to delete peer1");
-  }
-  memset(&peerInfo, 0, sizeof(peerInfo));
-  memcpy(peerInfo.peer_addr, Addr2, 6);//Addr1->Addr2 ////////////////////////////
-  peerInfo.channel = Channel;
-  peerInfo.encrypt = false;
-  while (esp_now_add_peer(&peerInfo) != ESP_OK) 
+  //while (esp_now_del_peer(Addr1) != ESP_OK) {
+  //  Serial.println("Failed to delete peer1");
+  //}
+  #if 0
+  memset(&dronePeer, 0, sizeof(dronePeer));
+  memcpy(dronePeer.peer_addr, Drone_mac, 6);//Addr1->Addr2 ////////////////////////////
+  dronePeer.channel = Channel;
+  dronePeer.encrypt = false;
+  while (esp_now_add_peer(&dronePeer) != ESP_OK) 
   {
         USBSerial.println("Failed to add peer2");
   }  
   esp_wifi_set_channel(Channel, WIFI_SECOND_CHAN_NONE);
+  #endif
 }
 
 void change_channel(uint8_t ch)
 {
-  peerInfo.channel = ch;
-  if (esp_now_mod_peer(&peerInfo)!=ESP_OK)
+  dronePeer.channel = ch;
+  if (esp_now_mod_peer(&dronePeer)!=ESP_OK)
   {
         USBSerial.println("Failed to modify peer");
         return;
@@ -441,9 +510,15 @@ void setup() {
   M5.Lcd.setRotation( 2 );
   M5.Lcd.setTextFont(2);
   M5.Lcd.setCursor(4, 2);
-  
-  if (M5.Btn.isPressed() || (Addr2[0] == 0xFF && Addr2[1] == 0xFF && Addr2[2] == 0xFF && Addr2[3] == 0xFF &&
-                               Addr2[4] == 0xFF && Addr2[5] == 0xFF)) {
+  wifi_esp_now_init();
+
+  // Only master needs to register broadcast peer for sending beacons
+  if (TDMA_DEVICE_ID == 0) {
+    broadcast_beacon_init();
+  }
+
+  if (M5.Btn.isPressed() || (Drone_mac[0] == 0xFF && Drone_mac[1] == 0xFF && Drone_mac[2] == 0xFF && Drone_mac[3] == 0xFF &&
+                               Drone_mac[4] == 0xFF && Drone_mac[5] == 0xFF)) {
     M5.Lcd.println("Push LCD panel!");
     while (1) {
       M5.update();
@@ -452,7 +527,6 @@ void setup() {
         break;
       }
     }
-    rc_init(CHANNEL, Addr1);  // TDMA: Use CHANNEL define
     USBSerial.printf("Button pressed!\n\r");
     M5.Lcd.println(" ");
     M5.Lcd.println("Push StampFly");
@@ -461,7 +535,8 @@ void setup() {
     M5.Lcd.println("Pairing...");
     peering();
   }
-  else rc_init(CHANNEL, Addr2);  // TDMA: Use CHANNEL define
+  drone_peer_init();
+  
   M5.Lcd.fillScreen(BLACK);
   joy_update();
 
@@ -568,6 +643,48 @@ void setup() {
       USBSerial.printf("TDMA Slave started (ID=%d)\n", TDMA_DEVICE_ID);
     }
   }
+
+  #if 0
+  // Register broadcast peer for beacon transmission (master only needs to send)
+  // Both master and slave can receive broadcasts without registering
+  if (TDMA_DEVICE_ID == 0) {
+    memset(&beaconPeer, 0, sizeof(beaconPeer));
+    memcpy(beaconPeer.peer_addr, Beacon_mac, 6);
+    beaconPeer.channel = CHANNEL;
+    beaconPeer.encrypt = false;
+    beaconPeer.ifidx = WIFI_IF_STA;
+
+    esp_err_t beacon_result = esp_now_add_peer(&beaconPeer);
+    if (beacon_result != ESP_OK) {
+      USBSerial.printf("Failed to add broadcast peer: %d\n", beacon_result);
+    } else {
+      USBSerial.printf("Broadcast peer added: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                       Beacon_mac[0], Beacon_mac[1], Beacon_mac[2],
+                       Beacon_mac[3], Beacon_mac[4], Beacon_mac[5]);
+    }
+  }
+  #endif
+
+  // Create beacon transmission task (master only)
+  if (TDMA_DEVICE_ID == 0) {
+    BaseType_t task_result = xTaskCreatePinnedToCore(
+        beacon_task,           // Task function
+        "BeaconTask",          // Task name
+        4096,                  // Stack size (bytes)
+        NULL,                  // Task parameter
+        configMAX_PRIORITIES - 1,  // High priority for precise timing
+        &beacon_task_handle,   // Task handle
+        1                      // Core 1 (Arduino loop runs on core 1)
+    );
+
+    if (task_result != pdPASS) {
+      USBSerial.println("Failed to create beacon task");
+    } else {
+      USBSerial.println("Beacon task created (high priority)");
+    }
+  }
+
+  USBSerial.printf("TDMA initialized. Device ID=%d, Channel=%d\n", TDMA_DEVICE_ID, CHANNEL);
 }
 
 uint8_t check_control_mode_change(void)
@@ -731,9 +848,9 @@ void loop() {
   uint8_t* d_int;
   
   //ブロードキャストの混信を防止するためこの機体のMACアドレスに送られてきたものか判断する
-  senddata[0] = peerInfo.peer_addr[3];////////////////////////////
-  senddata[1] = peerInfo.peer_addr[4];////////////////////////////
-  senddata[2] = peerInfo.peer_addr[5];////////////////////////////
+  senddata[0] = dronePeer.peer_addr[3];////////////////////////////
+  senddata[1] = dronePeer.peer_addr[4];////////////////////////////
+  senddata[2] = dronePeer.peer_addr[5];////////////////////////////
 
   d_int = (uint8_t*)&Throttle;
   senddata[3]=d_int[0];
@@ -777,17 +894,10 @@ void loop() {
   }
 
   // TDMA synchronized transmission
-  // Wait for beacon timer semaphore
-  if (xSemaphoreTake(beacon_sem, pdMS_TO_TICKS(20)) == pdTRUE) {
-    // Semaphore received - it's time to send
-
-    // Master device sends beacon first
-    if (TDMA_DEVICE_ID == 0) {
-      // Send beacon packet
-      uint8_t beacon_data[2] = {0xBE, 0xAC};  // Beacon marker
-      esp_now_send(peerInfo.peer_addr, beacon_data, sizeof(beacon_data));
-      delayMicroseconds(TDMA_BEACON_ADVANCE_US);  // Wait until frame start
-    }
+  // Wait for beacon timer semaphore (short timeout to not block drone control)
+  // Note: Beacon is sent by dedicated FreeRTOS task (master only), not here
+  if (xSemaphoreTake(beacon_sem, pdMS_TO_TICKS(2)) == pdTRUE) {
+    // Semaphore received - it's time to send control data
 
     // Calculate slot start time
     uint32_t slot_start_us = epoch_next_us - TDMA_BEACON_ADVANCE_US + (TDMA_DEVICE_ID * TDMA_SLOT_US);
@@ -809,19 +919,19 @@ void loop() {
     }
 
     // Send control data in our assigned slot
-    esp_err_t result = esp_now_send(peerInfo.peer_addr, senddata, sizeof(senddata));
+    esp_err_t result = esp_now_send(dronePeer.peer_addr, senddata, sizeof(senddata));
   } else {
     // Timeout - send anyway (fallback for non-TDMA mode)
-    esp_err_t result = esp_now_send(peerInfo.peer_addr, senddata, sizeof(senddata));
+    esp_err_t result = esp_now_send(dronePeer.peer_addr, senddata, sizeof(senddata));
   }
   #ifdef DEBUG
   USBSerial.printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
-    peerInfo.peer_addr[0],
-    peerInfo.peer_addr[1],
-    peerInfo.peer_addr[2],
-    peerInfo.peer_addr[3],
-    peerInfo.peer_addr[4],
-    peerInfo.peer_addr[5]);
+    dronePeer.peer_addr[0],
+    dronePeer.peer_addr[1],
+    dronePeer.peer_addr[2],
+    dronePeer.peer_addr[3],
+    dronePeer.peer_addr[4],
+    dronePeer.peer_addr[5]);
   #endif
   //Display information
   //float vbat =0.0;// M5.Axp.GetBatVoltage();
@@ -831,7 +941,7 @@ void loop() {
   switch (disp_counter)
   {
     case 0:
-      M5.Lcd.printf("MAC ADR %02X:%02X    ", peerInfo.peer_addr[4],peerInfo.peer_addr[5]);
+      M5.Lcd.printf("MAC ADR %02X:%02X    ", dronePeer.peer_addr[4],dronePeer.peer_addr[5]);
       break;
     case 1:
       M5.Lcd.printf("BAT 1:%4.1f 2:%4.1f", Battery_voltage[0],Battery_voltage[1]);
@@ -844,7 +954,7 @@ void loop() {
       #endif
       break;
     case 3:
-      M5.Lcd.printf("CHL: %02d",peerInfo.channel);
+      M5.Lcd.printf("CHL: %02d",dronePeer.channel);
       break;
     case 4:
       if( AltMode == ALT_CONTROL_MODE ) M5.Lcd.printf("-Auto ALT-  ");
@@ -912,7 +1022,6 @@ void show_battery_info(){
 
 void voltage_print(void)
 {
-
   M5.Lcd.setCursor(0, 17, 2);
   M5.Lcd.printf("%3.1fV", Battery_voltage);
 }
