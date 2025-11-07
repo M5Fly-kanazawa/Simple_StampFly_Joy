@@ -106,6 +106,9 @@ static volatile int32_t pll_error_us = 0;      // Phase error in microseconds
 static volatile int32_t pll_integral = 0;       // Integral term for PLL
 static const float PLL_KP = 0.1;                // Proportional gain
 static const float PLL_KI = 0.01;               // Integral gain
+static const int32_t PLL_ERROR_CLAMP = 1000;    // Max error for P term: ±1ms
+static const int32_t PLL_RESYNC_THRESHOLD = 5000; // Resync if error > 5ms
+static volatile bool first_beacon_received = false; // First beacon flag for slaves
 
 void rc_init(void);
 void data_send(void);
@@ -119,9 +122,19 @@ void IRAM_ATTR beacon_timer_callback(void* arg)
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xSemaphoreGiveFromISR(beacon_sem, &xHigherPriorityTaskWoken);
 
-    // Calculate next epoch time with PLL correction
-    int32_t correction = (int32_t)(PLL_KP * pll_error_us + PLL_KI * pll_integral);
-    epoch_next_us = esp_timer_get_time() + TDMA_FRAME_US + TDMA_BEACON_ADVANCE_US - correction;
+    if (TDMA_DEVICE_ID == 0) {
+        // Master: No PLL correction needed, autonomous timing
+        epoch_next_us = esp_timer_get_time() + TDMA_FRAME_US + TDMA_BEACON_ADVANCE_US;
+    } else {
+        // Slave: Apply PLL correction with clamping
+        // Clamp error to prevent excessive correction
+        int32_t clamped_error = pll_error_us;
+        if (clamped_error > PLL_ERROR_CLAMP) clamped_error = PLL_ERROR_CLAMP;
+        if (clamped_error < -PLL_ERROR_CLAMP) clamped_error = -PLL_ERROR_CLAMP;
+
+        int32_t correction = (int32_t)(PLL_KP * clamped_error + PLL_KI * pll_integral);
+        epoch_next_us = esp_timer_get_time() + TDMA_FRAME_US + TDMA_BEACON_ADVANCE_US - correction;
+    }
 
     if (xHigherPriorityTaskWoken == pdTRUE) {
         portYIELD_FROM_ISR();
@@ -158,20 +171,40 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
     if (data_len == 2 && recv_data[0] == 0xBE && recv_data[1] == 0xAC) {
       // Beacon packet detected
       if (TDMA_DEVICE_ID != 0) {
-        // Slave device received beacon from master - update PLL
+        // Slave device received beacon from master
         uint32_t current_time = esp_timer_get_time();
-        int32_t expected_time = epoch_next_us - TDMA_BEACON_ADVANCE_US;
 
-        // Calculate phase error
-        pll_error_us = current_time - expected_time;
-        pll_integral += pll_error_us;
+        if (!first_beacon_received) {
+          // First beacon: Immediate synchronization without PLL
+          epoch_next_us = current_time + TDMA_FRAME_US;
+          pll_error_us = 0;
+          pll_integral = 0;
+          first_beacon_received = true;
+          USBSerial.printf("First beacon sync at %u us\n", current_time);
+        } else {
+          // Subsequent beacons: Normal PLL operation
+          int32_t expected_time = epoch_next_us - TDMA_BEACON_ADVANCE_US;
+          pll_error_us = current_time - expected_time;
 
-        // Limit integral term to prevent windup
-        if (pll_integral > 10000) pll_integral = 10000;
-        if (pll_integral < -10000) pll_integral = -10000;
+          // Check for large error - indicates lost sync
+          if (pll_error_us > PLL_RESYNC_THRESHOLD || pll_error_us < -PLL_RESYNC_THRESHOLD) {
+            // Large error detected - resync immediately
+            epoch_next_us = current_time + TDMA_FRAME_US;
+            pll_integral = 0;  // Reset integral term
+            USBSerial.printf("Large error %d us - resyncing\n", pll_error_us);
+            pll_error_us = 0;  // Clear error after resync
+          } else {
+            // Normal PLL update
+            pll_integral += pll_error_us;
 
-        // Update next epoch time
-        epoch_next_us = current_time + TDMA_FRAME_US;
+            // Limit integral term to prevent windup
+            if (pll_integral > 10000) pll_integral = 10000;
+            if (pll_integral < -10000) pll_integral = -10000;
+
+            // Update next epoch time
+            epoch_next_us = current_time + TDMA_FRAME_US;
+          }
+        }
       }
       // Master device ignores beacon (own echo-back)
       return;
