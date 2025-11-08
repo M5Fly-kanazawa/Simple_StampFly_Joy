@@ -922,7 +922,114 @@ void loop() {
   int16_t _psi;// = getRudder();
   static uint8_t loop_counter = 0;
 
-  // Removed Loop_flag wait - synchronization now handled by TDMA semaphore
+  // ============================================================================
+  // CRITICAL: TDMA transmission MUST be first priority
+  // Check semaphore immediately at loop start to minimize latency
+  // ============================================================================
+  if (xSemaphoreTake(beacon_sem, 0) == pdTRUE) {
+    // Semaphore acquired - TDMA frame started, send immediately with previous data
+    // This minimizes delay between timer fire and transmission
+
+    // Check if drone is available before sending (prevent queue overflow)
+    if (!drone_available) {
+      // Check if it's time to retry
+      uint32_t current_time_ms = millis();
+      if (current_time_ms - drone_offline_time_ms >= DRONE_RETRY_INTERVAL_MS) {
+        // Time to retry - reset drone_available
+        drone_available = true;
+        drone_consecutive_failures = 0;
+        ESP_LOGI(TAG_DRONE, "Retrying drone transmission (offline for %u ms)...",
+                 current_time_ms - drone_offline_time_ms);
+      } else {
+        // Still in offline pause period - skip transmission
+        static uint32_t skip_log_count = 0;
+        skip_log_count++;
+        if (skip_log_count % 100 == 1) {
+          ESP_LOGD(TAG_DRONE, "Skipping drone send (offline) #%u, will retry in %u ms",
+                   skip_log_count, DRONE_RETRY_INTERVAL_MS - (current_time_ms - drone_offline_time_ms));
+        }
+        goto skip_tdma_send;  // Skip TDMA send but continue with rest of loop
+      }
+    }
+
+    // Check if drone peer exists before sending
+    static uint32_t peer_check_fail_count = 0;
+    if (!esp_now_is_peer_exist(dronePeer.peer_addr)) {
+      peer_check_fail_count++;
+      if (peer_check_fail_count % 100 == 1) {  // Log first occurrence and every 100th
+        ESP_LOGW(TAG_PEER, "Drone peer not found! Re-registering... (count=%u)", peer_check_fail_count);
+      }
+      drone_peer_init();  // Re-register drone peer
+    }
+
+    // Calculate slot start time (simplified - no reverse calculation needed!)
+    // frame_start_time_us = Timer fire time (master) or Beacon RX time (slave)
+    // TDMA_BEACON_ADVANCE_US = 800us (beacon sent before slot 0)
+    // Slot 0 starts at: frame_start_time_us + 800us
+    // Our slot starts at: Slot 0 + (DEVICE_ID * 1000us)
+    int64_t semaphore_acquired_time = esp_timer_get_time();  // Record when semaphore was acquired
+    int64_t slot_0_start_us = frame_start_time_us + TDMA_BEACON_ADVANCE_US;
+    int64_t slot_start_us = slot_0_start_us + (TDMA_DEVICE_ID * TDMA_SLOT_US);
+    int64_t current_us = esp_timer_get_time();
+
+    // Debug: Log timing calculations (first 20 frames)
+    static uint32_t timing_debug_count = 0;
+    timing_debug_count++;
+    if (timing_debug_count <= 20) {
+      ESP_LOGI(TAG_TDMA, "Frame #%u: sem_acq=%lld, frame_start=%lld, slot_start=%lld, current=%lld, diff=%lld",
+               timing_debug_count, semaphore_acquired_time, frame_start_time_us,
+               slot_start_us, current_us, slot_start_us - current_us);
+    }
+
+    // Precise microsecond timing for TDMA slot synchronization
+    if (slot_start_us > current_us) {
+      int64_t wait_us = slot_start_us - current_us;
+
+      // If wait time > 20us, use delayMicroseconds for precise timing
+      if (wait_us > 20) {
+        delayMicroseconds(wait_us - 10);  // Wait until 10us before slot start
+      }
+
+      // Final precise timing with busy wait
+      while (esp_timer_get_time() < slot_start_us) {
+        // Busy wait for ultimate precision
+      }
+    } else {
+      // Slot start time is in the past - this is a timing error!
+      static uint32_t late_count = 0;
+      late_count++;
+      if (late_count <= 20 || late_count % 100 == 0) {
+        ESP_LOGW(TAG_TDMA, "Slot start missed #%u! slot_start was %lld us ago (sem_acq_delay=%lld us)",
+                 late_count, current_us - slot_start_us, semaphore_acquired_time - frame_start_time_us);
+      }
+    }
+
+    // Send control data in our assigned slot (immediately after timing wait)
+    int64_t actual_send_time = esp_timer_get_time();
+    esp_err_t result = esp_now_send(dronePeer.peer_addr, senddata, sizeof(senddata));
+
+    // Log send result for debugging (controlled by ESP_LOG level)
+    static uint32_t send_count = 0;
+    send_count++;
+    if (result != ESP_OK) {
+      ESP_LOGE(TAG_DRONE, "Send FAILED #%u: err=%d (MAC=%02X:%02X)",
+               send_count, result, dronePeer.peer_addr[4], dronePeer.peer_addr[5]);
+    } else if (send_count <= 20 || send_count % 100 == 0) {
+      // Log timing for first 20 sends to debug slot timing
+      int64_t timing_error = actual_send_time - slot_start_us;
+      ESP_LOGD(TAG_DRONE, "Send OK #%u (MAC=%02X:%02X) slot_err=%lld us | CB: ok=%u fail=%u",
+               send_count, dronePeer.peer_addr[4], dronePeer.peer_addr[5], timing_error,
+               drone_cb_success, drone_cb_fail);
+    }
+  }
+  // TDMA mode: No fallback transmission
+  // If semaphore is not available, skip this frame (don't send)
+skip_tdma_send:
+
+  // ============================================================================
+  // After TDMA send, perform normal loop processing
+  // This prepares data for NEXT TDMA frame
+  // ============================================================================
   etime = stime;
   stime = micros();
   dtime = stime - etime;
