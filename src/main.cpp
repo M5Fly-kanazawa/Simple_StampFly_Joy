@@ -57,7 +57,7 @@ static const char* TAG_PEER = "PEER";
 #define TDMA_FRAME_US 10000      // 1 frame = 10ms
 #define TDMA_SLOT_US 1000        // 1 slot = 1ms
 #define TDMA_NUM_SLOTS 10        // 10 slots per frame
-#define TDMA_BEACON_ADVANCE_US 800  // Beacon fires 800us before slot 0 start (to avoid interference with master's slot 0 transmission)
+#define TDMA_BEACON_ADVANCE_US 250  // Beacon fires 250us before slot 0 start
 
 #define ANGLECONTROL 0
 #define RATECONTROL 1
