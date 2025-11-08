@@ -27,6 +27,18 @@
 //#define DEBUG
 
 #include <Arduino.h>
+#include <esp_log.h>
+
+// Log tags for different modules
+static const char* TAG_MAIN = "MAIN";
+static const char* TAG_BEACON = "BEACON";
+static const char* TAG_DRONE = "DRONE";
+static const char* TAG_TDMA = "TDMA";
+static const char* TAG_PEER = "PEER";
+
+// Global log level control (set at compile time)
+// ESP_LOG_NONE, ESP_LOG_ERROR, ESP_LOG_WARN, ESP_LOG_INFO, ESP_LOG_DEBUG, ESP_LOG_VERBOSE
+#define GLOBAL_LOG_LEVEL ESP_LOG_DEBUG  // Change this to control verbosity
 #include <M5AtomS3.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -45,7 +57,7 @@
 #define TDMA_FRAME_US 10000      // 1 frame = 10ms
 #define TDMA_SLOT_US 1000        // 1 slot = 1ms
 #define TDMA_NUM_SLOTS 10        // 10 slots per frame
-#define TDMA_BEACON_ADVANCE_US 250  // Beacon fires 250us before frame start
+#define TDMA_BEACON_ADVANCE_US 800  // Beacon fires 800us before slot 0 start (to avoid interference with master's slot 0 transmission)
 
 #define ANGLECONTROL 0
 #define RATECONTROL 1
@@ -98,7 +110,10 @@ volatile uint8_t Channel = CHANNEL;
 static esp_timer_handle_t beacon_timer;
 static SemaphoreHandle_t beacon_sem;
 static TaskHandle_t beacon_task_handle = NULL;  // Task for beacon transmission
-static volatile int64_t epoch_next_us;  // 64-bit for overflow protection
+// TDMA timing - simplified design
+// frame_start_time_us = Current frame's reference time (timer fire time or beacon RX time)
+// All slot calculations use this as the base reference
+static volatile int64_t frame_start_time_us = 0;  // Current frame's timer fire time (64-bit for overflow protection)
 
 // PLL for synchronization
 static volatile int32_t pll_error_us = 0;      // Phase error in microseconds
@@ -141,7 +156,9 @@ static volatile uint32_t drone_cb_fail = 0;
 // Drone connectivity detection
 static volatile uint32_t drone_consecutive_failures = 0;
 static volatile bool drone_available = true;  // Assume available at start
-static const uint32_t DRONE_FAILURE_THRESHOLD = 50;  // 50 consecutive failures = drone offline
+static const uint32_t DRONE_FAILURE_THRESHOLD = 10;  // 10 consecutive failures = drone offline (100ms)
+static volatile uint32_t drone_offline_time_ms = 0;  // Time when drone went offline
+static const uint32_t DRONE_RETRY_INTERVAL_MS = 5000;  // Retry every 5 seconds
 
 // Beacon transmission task (for master only)
 // This task waits for notification from timer ISR and sends beacon
@@ -160,7 +177,7 @@ void beacon_task(void* parameter)
         // Check if beacon peer exists in peer table before sending
         if (!esp_now_is_peer_exist(beaconPeer.peer_addr)) {
             // Peer not found - try to re-register
-            USBSerial.printf("Beacon peer not found! Re-registering...\n");
+            ESP_LOGW(TAG_BEACON, "Peer not found! Re-registering...");
             broadcast_beacon_init();
             beacon_count++;
             continue;  // Skip this beacon and wait for next timer
@@ -178,8 +195,8 @@ void beacon_task(void* parameter)
                 // Double-check if peer really exists (debugging)
                 bool peer_exists = esp_now_is_peer_exist(beaconPeer.peer_addr);
                 if (beacon_count % 10 == 0 || beacon_count <= 100) {
-                    USBSerial.printf("ESP_ERR_ESPNOW_NOT_FOUND but peer_exists=%d at #%u\n",
-                                   peer_exists, beacon_count);
+                    ESP_LOGD(TAG_BEACON, "ESP_ERR_ESPNOW_NOT_FOUND but peer_exists=%d at #%u",
+                             peer_exists, beacon_count);
                 }
                 // Retry immediately once
                 delayMicroseconds(50);
@@ -190,52 +207,52 @@ void beacon_task(void* parameter)
                     // Try to get peer info before deleting
                     esp_now_peer_info_t peer_info;
                     esp_err_t get_result = esp_now_get_peer(beaconPeer.peer_addr, &peer_info);
-                    USBSerial.printf("Peer get_result=%d (0=found) at #%u\n", get_result, beacon_count);
+                    ESP_LOGD(TAG_BEACON, "Peer get_result=%d (0=found) at #%u", get_result, beacon_count);
 
                     if (get_result == ESP_OK) {
-                        USBSerial.printf("Peer details: ch=%d, ifidx=%d, encrypt=%d\n",
-                                       peer_info.channel, peer_info.ifidx, peer_info.encrypt);
+                        ESP_LOGD(TAG_BEACON, "Peer details: ch=%d, ifidx=%d, encrypt=%d",
+                                 peer_info.channel, peer_info.ifidx, peer_info.encrypt);
                     }
 
                     esp_now_del_peer(beaconPeer.peer_addr);  // Remove old peer
-                    delay(10);
+                    delayMicroseconds(100);  // Short delay for peer cleanup (was delay(5))
                     broadcast_beacon_init();  // Re-register
                     last_re_init = beacon_count;
-                    USBSerial.printf("Beacon peer re-init at #%u (err=%d, total_err=%u)\n",
-                                   beacon_count, result, error_count);
+                    ESP_LOGW(TAG_BEACON, "Peer re-init at #%u (err=%d, total_err=%u)",
+                             beacon_count, result, error_count);
                 }
             }
             // ESP_ERR_ESPNOW_NO_MEM or other errors
             else {
                 // Just log other errors (buffer full, etc.)
                 if (beacon_count % 100 == 0) {
-                    USBSerial.printf("Beacon send error: %d at #%u\n", result, beacon_count);
+                    ESP_LOGW(TAG_BEACON, "Send error: %d at #%u", result, beacon_count);
                 }
             }
         }
 
         beacon_count++;
 
-        #if 1  // Enable logging for debugging
+        #if 0  // Disable logging to prevent blocking in task context
         int64_t current_time = esp_timer_get_time();
         int64_t interval_us = current_time - last_beacon_sent_us;
 
         // Log first 100 beacons with detailed interval timing
         if (beacon_count <= 100) {
-            USBSerial.printf("Beacon TX #%u: interval=%lld us, result=%d\n",
-                           beacon_count, interval_us, result);
+            ESP_LOGD(TAG_BEACON, "Beacon TX #%u: interval=%lld us, result=%d",
+                     beacon_count, interval_us, result);
         }
         // Then log every 100 beacons to monitor stability
         else if (beacon_count % 100 == 0) {
-            USBSerial.printf("Beacon TX #%u: interval=%lld us, result=%d, errors=%u\n",
-                           beacon_count, interval_us, result, error_count);
+            ESP_LOGD(TAG_BEACON, "Beacon TX #%u: interval=%lld us, result=%d, errors=%u",
+                     beacon_count, interval_us, result, error_count);
         }
         // Every 1000 beacons show full statistics
         if (beacon_count % 1000 == 0) {
-            USBSerial.printf("  Total CB: ok=%u fail=%u | Beacon CB: ok=%u fail=%u | Drone CB: ok=%u fail=%u\n",
-                           send_success_count, send_fail_count,
-                           beacon_cb_success, beacon_cb_fail,
-                           drone_cb_success, drone_cb_fail);
+            ESP_LOGI(TAG_BEACON, "Total CB: ok=%u fail=%u | Beacon CB: ok=%u fail=%u | Drone CB: ok=%u fail=%u",
+                     send_success_count, send_fail_count,
+                     beacon_cb_success, beacon_cb_fail,
+                     drone_cb_success, drone_cb_fail);
         }
 
         last_beacon_sent_us = current_time;
@@ -253,7 +270,7 @@ void IRAM_ATTR beacon_timer_callback(void* arg)
     callback_count++;
 
     // Measure timer callback interval (master only, for debugging)
-    #if 1
+    #if 0  // Disable logging to prevent blocking in ISR context
     if (TDMA_DEVICE_ID == 0 && callback_count <= 100) {
         int64_t now = esp_timer_get_time();
         int64_t timer_interval = now - last_callback_time;
@@ -265,18 +282,16 @@ void IRAM_ATTR beacon_timer_callback(void* arg)
     }
     #endif
 
+    // Record current frame start time (timer fire time)
+    // This is the reference time for all slot calculations in this frame
+    frame_start_time_us = esp_timer_get_time();
+
     // Master: Notify beacon task to send beacon immediately
     if (TDMA_DEVICE_ID == 0 && beacon_task_handle != NULL) {
         vTaskNotifyGiveFromISR(beacon_task_handle, &xHigherPriorityTaskWoken);
     }
-
-    // Update epoch time for next frame
-    if (TDMA_DEVICE_ID == 0) {
-        // Master: Autonomous timing based on timer callback
-        epoch_next_us = esp_timer_get_time() + TDMA_FRAME_US + TDMA_BEACON_ADVANCE_US;
-    }
-    // Slave: epoch_next_us is updated ONLY in beacon reception callback
-    // Do NOT update epoch_next_us here, as slave timer is not synchronized with master
+    // Slave: frame_start_time_us will be overwritten when beacon is received (more accurate sync)
+    //        If beacon is lost, this timer-based value serves as fallback
 
     // Give semaphore to signal that it's time to send control data
     xSemaphoreGiveFromISR(beacon_sem, &xHigherPriorityTaskWoken);
@@ -311,7 +326,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
       drone_consecutive_failures = 0;  // Reset failure counter on success
       if (!drone_available) {
         drone_available = true;  // Drone is back online
-        USBSerial.printf("Drone reconnected!\n");
+        ESP_LOGI(TAG_DRONE, "Drone reconnected!");
       }
     }
   } else {
@@ -322,11 +337,12 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
       drone_cb_fail++;
       drone_consecutive_failures++;
 
-      // Check if drone should be marked offline
+      // Log if many consecutive failures (stop transmitting to prevent queue overflow)
       if (drone_available && drone_consecutive_failures >= DRONE_FAILURE_THRESHOLD) {
         drone_available = false;
-        USBSerial.printf("Drone offline detected (failures=%u). Stopping drone transmissions.\n",
-                       drone_consecutive_failures);
+        drone_offline_time_ms = millis();  // Record when drone went offline
+        ESP_LOGW(TAG_DRONE, "Drone offline detected (failures=%u). Pausing transmission (will retry in %u ms).",
+                 drone_consecutive_failures, DRONE_RETRY_INTERVAL_MS);
       }
     }
 
@@ -335,12 +351,12 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
     uint32_t now = millis();
     if (now - last_log_time > 1000) {  // Log once per second max
       if (is_beacon) {
-        USBSerial.printf("Send CB: FAIL BEACON (beacon_ok=%u, beacon_fail=%u)\n",
-                       beacon_cb_success, beacon_cb_fail);
+        ESP_LOGW(TAG_BEACON, "Send CB: FAIL BEACON (beacon_ok=%u, beacon_fail=%u)",
+                 beacon_cb_success, beacon_cb_fail);
       } else {
-        USBSerial.printf("Send CB: FAIL DRONE %02X:%02X:%02X:%02X:%02X:%02X (drone_ok=%u, drone_fail=%u)\n",
-                       mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5],
-                       drone_cb_success, drone_cb_fail);
+        ESP_LOGW(TAG_DRONE, "Send CB: FAIL DRONE %02X:%02X:%02X:%02X:%02X:%02X (drone_ok=%u, drone_fail=%u)",
+                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5],
+                 drone_cb_success, drone_cb_fail);
       }
       last_log_time = now;
     }
@@ -361,7 +377,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
         Drone_mac[3]      = recv_data[4];
         Drone_mac[4]      = recv_data[5];
         Drone_mac[5]      = recv_data[6];
-        USBSerial.printf("Receive ! (Using CHANNEL=%d)\n", CHANNEL);
+        ESP_LOGI(TAG_PEER, "Receive ! (Using CHANNEL=%d)", CHANNEL);
     }
   }
   else {
@@ -371,93 +387,49 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
       // Beacon packet detected
       if (TDMA_DEVICE_ID != 0) {
         // Slave device received beacon from master
+        // Update frame start time to beacon reception time (accurate synchronization)
         int64_t current_time = esp_timer_get_time();
+        frame_start_time_us = current_time;  // This is the current frame's reference time
         last_beacon_time_us = current_time;  // Update last beacon time
 
-        #if 1  // Enable logging to verify beacon reception on slave
+        // Optional: PLL for monitoring synchronization quality (future use)
+        #if 0  // Disable logging to prevent blocking in ISR context
         static int64_t last_recv_time = 0;
         int64_t interval_us = current_time - last_recv_time;
         static uint32_t beacon_recv_count = 0;
         beacon_recv_count++;
 
-        // Calculate expected time and error BEFORE processing (for accurate logging)
+        // Calculate expected time and error for monitoring
         int64_t expected_time_for_log = 0;
         int32_t error_for_log = 0;
         if (beacon_recv_count > 1) {
-          expected_time_for_log = epoch_next_us;
+          expected_time_for_log = last_recv_time + TDMA_FRAME_US;
           error_for_log = current_time - expected_time_for_log;
         }
 
         // Log first 100 beacons with detailed info
         if (beacon_recv_count <= 100) {
           if (beacon_recv_count == 1) {
-            USBSerial.printf("Beacon RX #%u: interval=%lld us (first beacon)\n",
-                           beacon_recv_count, interval_us);
+            ESP_LOGD(TAG_BEACON, "Beacon RX #%u: interval=%lld us (first beacon)",
+                     beacon_recv_count, interval_us);
           } else {
-            USBSerial.printf("Beacon RX #%u: interval=%lld us, error=%d us\n",
-                           beacon_recv_count, interval_us, error_for_log);
+            ESP_LOGD(TAG_BEACON, "Beacon RX #%u: interval=%lld us, error=%d us",
+                     beacon_recv_count, interval_us, error_for_log);
           }
         }
         // Then log every 100 beacons (every 1 second)
         else if (beacon_recv_count % 100 == 0) {
-          USBSerial.printf("Beacon RX #%u: interval=%lld us, error=%d us\n",
-                         beacon_recv_count, interval_us, error_for_log);
+          ESP_LOGD(TAG_BEACON, "Beacon RX #%u: interval=%lld us, error=%d us",
+                   beacon_recv_count, interval_us, error_for_log);
         }
 
         last_recv_time = current_time;
         #endif
 
         if (!first_beacon_received) {
-          // First beacon: Immediate synchronization without PLL
-          epoch_next_us = current_time + TDMA_FRAME_US;
+          first_beacon_received = true;
           pll_error_us = 0;
           pll_integral = 0;
-          first_beacon_received = true;
-          // USBSerial.printf("First beacon sync\n");  // Disabled to prevent timing jitter
-        } else {
-          // Subsequent beacons: Calculate PLL error and update epoch_next_us
-          int32_t expected_time = epoch_next_us;
-          pll_error_us = current_time - expected_time;
-
-          // Check for large error - indicates lost sync
-          if (pll_error_us > PLL_RESYNC_THRESHOLD || pll_error_us < -PLL_RESYNC_THRESHOLD) {
-            // Large error detected - resync immediately
-            static uint32_t resync_count = 0;
-            resync_count++;
-
-            // Log resync with original error (before clearing)
-            if (resync_count <= 100 || resync_count % 100 == 0) {
-              USBSerial.printf("RESYNC #%u: error=%d us (threshold=±%d us)\n",
-                             resync_count, (int)pll_error_us, PLL_RESYNC_THRESHOLD);
-            }
-
-            // Resync: next beacon expected in exactly 10ms
-            epoch_next_us = current_time + TDMA_FRAME_US;
-            pll_integral = 0;  // Reset integral term
-            pll_error_us = 0;  // Clear error after resync
-          } else {
-            // Normal PLL update
-            pll_integral += pll_error_us;
-
-            // Limit integral term to prevent windup
-            if (pll_integral > 10000) pll_integral = 10000;
-            if (pll_integral < -10000) pll_integral = -10000;
-
-            // Apply PLL correction to next expected beacon time
-            // Clamp error to prevent excessive correction
-            int32_t clamped_error = pll_error_us;
-            if (clamped_error > PLL_ERROR_CLAMP) clamped_error = PLL_ERROR_CLAMP;
-            if (clamped_error < -PLL_ERROR_CLAMP) clamped_error = -PLL_ERROR_CLAMP;
-
-            int32_t correction = (int32_t)(PLL_KP * clamped_error + PLL_KI * pll_integral);
-
-            // Update epoch_next_us: base time (10ms from now) + PLL correction
-            // Correction is subtracted because:
-            //   - If error > 0 (late), correction > 0, so we ADD to next expected time (wait longer)
-            //   - If error < 0 (early), correction < 0, so we SUBTRACT from next expected time (wait less)
-            // But we want the opposite: if beacon came early, expect it earlier next time
-            epoch_next_us = current_time + TDMA_FRAME_US - correction;
-          }
         }
       }
       // Master device ignores beacon (own echo-back)
@@ -494,10 +466,10 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
       return;
     }
 
-    if ((dummy[0]==99)&&(dummy[1]==99))Serial.printf("#PID Gain P Ti Td Eta ");
+    if ((dummy[0]==99)&&(dummy[1]==99))ESP_LOGI(TAG_DRONE, "#PID Gain P Ti Td Eta ");
 
     uint8_t num_floats = (data_len-offset)/4;
-    USBSerial.printf("%d ", num_floats);
+    ESP_LOGV(TAG_DRONE, "num_floats=%d ", num_floats);
 
     for (uint8_t i=0; i < num_floats; i++)
     {
@@ -508,10 +480,10 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
         dummy[1]=recv_data[base_idx + 1];
         dummy[2]=recv_data[base_idx + 2];
         dummy[3]=recv_data[base_idx + 3];
-        USBSerial.printf("%9.4f ", a);
+        ESP_LOGV(TAG_DRONE, "float[%d]=%9.4f ", i, a);
       }
     }
-    USBSerial.printf("\r\n");
+    ESP_LOGV(TAG_DRONE, "telemetry end");
     #endif
   }
 }
@@ -537,14 +509,14 @@ void save_data(void)
   fp.close();
   SPIFFS.end();
 
-  USBSerial.printf("Saved Data:%d,[%02X:%02X:%02X:%02X:%02X:%02X]",
-      CHANNEL,  // Use define value
-      Drone_mac[0],
-      Drone_mac[1],
-      Drone_mac[2],
-      Drone_mac[3],
-      Drone_mac[4],
-      Drone_mac[5]);
+  ESP_LOGI(TAG_PEER, "Saved Data: CH=%d, MAC=[%02X:%02X:%02X:%02X:%02X:%02X]",
+           CHANNEL,  // Use define value
+           Drone_mac[0],
+           Drone_mac[1],
+           Drone_mac[2],
+           Drone_mac[3],
+           Drone_mac[4],
+           Drone_mac[5]);
 }
 
 // EEPROMからデータを読み出す
@@ -555,7 +527,7 @@ void load_data(void)
   char buf[BUF_SIZE + 1];
   while (fp.read((uint8_t *)buf, BUF_SIZE) == BUF_SIZE)
   {
-    //USBSerial.print(buf);
+    //ESP_LOGV(TAG_PEER, "buf=%s", buf);
     uint8_t saved_channel;  // Temporary variable for saved channel
     sscanf(buf,"%hhd,%hhX,%hhX,%hhX,%hhX,%hhX,%hhX",
           &saved_channel,  // Read but don't use for TDMA
@@ -567,14 +539,14 @@ void load_data(void)
           &Drone_mac[5]);
     // TDMA mode: Always use CHANNEL define, ignore saved channel
     Channel = CHANNEL;
-    USBSerial.printf("Loaded MAC (using CHANNEL=%d): %02X:%02X:%02X:%02X:%02X:%02X\n\r",
-          CHANNEL,
-          Drone_mac[0],
-          Drone_mac[1],
-          Drone_mac[2],
-          Drone_mac[3],
-          Drone_mac[4],
-          Drone_mac[5]);
+    ESP_LOGI(TAG_PEER, "Loaded MAC (using CHANNEL=%d): %02X:%02X:%02X:%02X:%02X:%02X",
+             CHANNEL,
+             Drone_mac[0],
+             Drone_mac[1],
+             Drone_mac[2],
+             Drone_mac[3],
+             Drone_mac[4],
+             Drone_mac[5]);
   }
   fp.close();
   SPIFFS.end();
@@ -602,9 +574,9 @@ void wifi_esp_now_init(void)
         esp_now_unregister_recv_cb();
         esp_now_register_recv_cb(OnDataRecv);
         esp_now_register_send_cb(OnDataSent);  // Register send callback
-        USBSerial.println("ESPNow Init Success");
+        ESP_LOGI(TAG_MAIN, "ESPNow Init Success");
     } else {
-        USBSerial.println("ESPNow Init Failed");
+        ESP_LOGE(TAG_MAIN, "ESPNow Init Failed");
         ESP.restart();
     }
   // ESP-NOWコールバック登録
@@ -617,7 +589,7 @@ void wifi_esp_now_init(void)
     dronePeer.encrypt = false;
     uint8_t peer_mac_addre;
     while (esp_now_add_peer(&dronePeer) != ESP_OK) {
-        USBSerial.println("Failed to add peer");
+        ESP_LOGW(TAG_PEER, "Failed to add peer");
     }
     esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
 #endif
@@ -635,23 +607,23 @@ void broadcast_beacon_init(void)
     esp_err_t result = esp_now_add_peer(&beaconPeer);
     uint8_t retry = 0;
     while (result != ESP_OK && retry < 5) {
-        USBSerial.printf("Failed to add beacon peer: %d (retry %d)\n", result, retry);
-        delay(100);
+        ESP_LOGW(TAG_PEER, "Failed to add beacon peer: %d (retry %d)", result, retry);
+        delayMicroseconds(100);  // Short delay for peer cleanup (was delay(5))
         result = esp_now_add_peer(&beaconPeer);
         retry++;
     }
 
     if (result == ESP_OK) {
-        USBSerial.printf("Beacon peer added: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                       Beacon_mac[0], Beacon_mac[1], Beacon_mac[2],
-                       Beacon_mac[3], Beacon_mac[4], Beacon_mac[5]);
+        ESP_LOGI(TAG_PEER, "Beacon peer added: %02X:%02X:%02X:%02X:%02X:%02X",
+                 Beacon_mac[0], Beacon_mac[1], Beacon_mac[2],
+                 Beacon_mac[3], Beacon_mac[4], Beacon_mac[5]);
     } else {
-        USBSerial.printf("Failed to add beacon peer after retries: %d\n", result);
+        ESP_LOGE(TAG_PEER, "Failed to add beacon peer after retries: %d", result);
     }
 
     // チャンネルの設定はESP-NOWの設定の前に行う必要があるかもしれない
     //esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
-    delay(500);
+    delayMicroseconds(100);  // Short delay for initialization (was delay(10))
 }
 
 void drone_peer_init(void)
@@ -662,13 +634,13 @@ void drone_peer_init(void)
     dronePeer.encrypt = false;
     dronePeer.ifidx = WIFI_IF_STA;
     while (esp_now_add_peer(&dronePeer) != ESP_OK) {
-        USBSerial.println("Failed to add drone peer");
-        delay(100);
+        ESP_LOGW(TAG_PEER, "Failed to add drone peer");
+        delayMicroseconds(100);  // Short delay for peer cleanup (was delay(10))
     }
-    USBSerial.println("Success to add drone peer");
+    ESP_LOGI(TAG_PEER, "Success to add drone peer");
     // チャンネルの設定はESP-NOWの設定の前に行う必要があるかもしれない
     //esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
-    delay(500);
+    delayMicroseconds(100);  // Short delay for initialization (was delay(10))
 }
 
 void peering(void)
@@ -686,7 +658,7 @@ void peering(void)
         break;
       }
     }
-    USBSerial.printf("Button pressed!\n\r");
+    ESP_LOGI(TAG_PEER, "Button pressed!");
     M5.Lcd.println(" ");
     M5.Lcd.println("Push StampFly");
     M5.Lcd.println("    Reset Button!");
@@ -720,9 +692,9 @@ void peering(void)
     Channel = CHANNEL;
     save_data();
     is_peering = 0;
-    USBSerial.printf("Channel:%02d\n\r", Channel);
-    USBSerial.printf("StampFly MAC:%02X:%02X:%02X:%02X:%02X:%02X:\n\r",
-                      Drone_mac[0],Drone_mac[1],Drone_mac[2],Drone_mac[3],Drone_mac[4],Drone_mac[5]);
+    ESP_LOGI(TAG_PEER, "Channel: %02d", Channel);
+    ESP_LOGI(TAG_PEER, "StampFly MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+             Drone_mac[0], Drone_mac[1], Drone_mac[2], Drone_mac[3], Drone_mac[4], Drone_mac[5]);
   }
 }
 
@@ -732,7 +704,7 @@ void change_channel(uint8_t ch)
   dronePeer.channel = ch;
   if (esp_now_mod_peer(&dronePeer)!=ESP_OK)
   {
-        USBSerial.println("Failed to modify peer");
+        ESP_LOGW(TAG_PEER, "Failed to modify peer");
         return;
   }
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
@@ -743,6 +715,17 @@ void change_channel(uint8_t ch)
 
 void setup() {
   M5.begin();
+
+  // Initialize ESP_LOG system
+  esp_log_level_set("*", GLOBAL_LOG_LEVEL);  // Set global log level
+  esp_log_level_set(TAG_MAIN, GLOBAL_LOG_LEVEL);
+  esp_log_level_set(TAG_BEACON, GLOBAL_LOG_LEVEL);
+  esp_log_level_set(TAG_DRONE, GLOBAL_LOG_LEVEL);
+  esp_log_level_set(TAG_TDMA, GLOBAL_LOG_LEVEL);
+  esp_log_level_set(TAG_PEER, GLOBAL_LOG_LEVEL);
+
+  ESP_LOGI(TAG_MAIN, "StampFly Joy Controller starting...");
+
   Wire1.begin(38, 39, 400*1000);
   load_data();
   M5.update();
@@ -750,8 +733,8 @@ void setup() {
   M5.Lcd.setRotation( 2 );
   M5.Lcd.setTextFont(2);
   M5.Lcd.setCursor(4, 2);
-  //3秒待つ
-  delay(3000);
+  //0.5秒待つ
+  delay(500);
   wifi_esp_now_init();
 
   // Broadcast peer needed for both master (beacon TX) and slave (pairing)
@@ -770,7 +753,7 @@ void setup() {
     while(getOptionButton())joy_update();
   }
   AltMode =NOT_ALT_CONTROL_MODE;
-  delay(500);
+  delay(10);
 
   if (StickMode == 3)
   {
@@ -799,7 +782,7 @@ void setup() {
   int nDevices;
 
 ////////////////////////////////////////////////////////
-  USBSerial.println("Scanning... Wire1");
+  ESP_LOGI(TAG_MAIN, "Scanning... Wire1");
 
   nDevices = 0;
   for (address = 1; address < 127; address++ )
@@ -809,34 +792,26 @@ void setup() {
 
     if (error == 0)
     {
-      USBSerial.print("I2C device found at address 0x");
-      if (address < 16)
-        USBSerial.print("0");
-      USBSerial.print(address, HEX);
-      USBSerial.println("  !");
-
+      ESP_LOGI(TAG_MAIN, "I2C device found at address 0x%02X !", address);
       nDevices++;
     }
     else if (error == 4)
     {
-      USBSerial.print("Unknown error at address 0x");
-      if (address < 16)
-        USBSerial.print("0");
-      USBSerial.println(address, HEX);
+      ESP_LOGW(TAG_MAIN, "Unknown error at address 0x%02X", address);
     }
   }
   if (nDevices == 0)
-    USBSerial.println("No I2C devices found\n");
+    ESP_LOGI(TAG_MAIN, "No I2C devices found");
   else
-    USBSerial.println("done\n");
+    ESP_LOGI(TAG_MAIN, "I2C scan done");
 
   esp_now_get_version(&espnow_version);
-  USBSerial.printf("ESP-NOW Version %d\n", espnow_version);
+  ESP_LOGI(TAG_MAIN, "ESP-NOW Version %d", espnow_version);
 
   // TDMA初期化 (hw_timer removed - using esp_timer only)
   beacon_sem = xSemaphoreCreateBinary();
   if (beacon_sem == NULL) {
-    USBSerial.println("Failed to create beacon semaphore");
+    ESP_LOGE(TAG_TDMA, "Failed to create beacon semaphore");
   }
 
   // TDMA timer setup
@@ -848,11 +823,11 @@ void setup() {
 
   esp_err_t err = esp_timer_create(&beacon_timer_args, &beacon_timer);
   if (err != ESP_OK) {
-    USBSerial.printf("Failed to create TDMA timer: %d\n", err);
+    ESP_LOGE(TAG_TDMA, "Failed to create TDMA timer: %d", err);
   }
 
-  // Initialize epoch time
-  epoch_next_us = esp_timer_get_time() + TDMA_FRAME_US;
+  // Initialize frame start time
+  frame_start_time_us = esp_timer_get_time();
 
   // Create beacon transmission task BEFORE starting timer (master only)
   // This ensures beacon_task_handle is set when timer callback fires
@@ -868,26 +843,26 @@ void setup() {
     );
 
     if (task_result != pdPASS) {
-      USBSerial.println("Failed to create beacon task");
+      ESP_LOGE(TAG_TDMA, "Failed to create beacon task");
       beacon_task_handle = NULL;  // Ensure it's NULL on failure
     } else {
-      USBSerial.printf("Beacon task created (handle=%p)\n", beacon_task_handle);
+      ESP_LOGI(TAG_TDMA, "Beacon task created (handle=%p)", beacon_task_handle);
     }
   }
 
   // Start TDMA timer AFTER creating beacon task (both master and slave use it for synchronization)
   err = esp_timer_start_periodic(beacon_timer, TDMA_FRAME_US);
   if (err != ESP_OK) {
-    USBSerial.printf("Failed to start TDMA timer: %d\n", err);
+    ESP_LOGE(TAG_TDMA, "Failed to start TDMA timer: %d", err);
   } else {
     if (TDMA_DEVICE_ID == 0) {
-      USBSerial.printf("TDMA Master timer started (ID=%d, period=%d us)\n", TDMA_DEVICE_ID, TDMA_FRAME_US);
+      ESP_LOGI(TAG_TDMA, "TDMA Master timer started (ID=%d, period=%d us)", TDMA_DEVICE_ID, TDMA_FRAME_US);
     } else {
-      USBSerial.printf("TDMA Slave timer started (ID=%d, period=%d us)\n", TDMA_DEVICE_ID, TDMA_FRAME_US);
+      ESP_LOGI(TAG_TDMA, "TDMA Slave timer started (ID=%d, period=%d us)", TDMA_DEVICE_ID, TDMA_FRAME_US);
     }
   }
 
-  USBSerial.printf("TDMA initialized. Device ID=%d, Channel=%d\n", TDMA_DEVICE_ID, CHANNEL);
+  ESP_LOGI(TAG_TDMA, "TDMA initialized. Device ID=%d, Channel=%d", TDMA_DEVICE_ID, CHANNEL);
 }
 
 uint8_t check_control_mode_change(void)
@@ -910,7 +885,7 @@ uint8_t check_control_mode_change(void)
       state = 1;
     }
   }
-  //USBSerial.printf("%d %d\n\r", state, flag);
+  //ESP_LOGV(TAG_MAIN, "control_mode state=%d flag=%d", state, flag);
   return state;
 }
 
@@ -934,7 +909,7 @@ uint8_t check_alt_mode_change(void)
       state = 1;
     }
   }
-  //USBSerial.printf("%d %d\n\r", state, flag);
+  //ESP_LOGV(TAG_MAIN, "alt_mode state=%d flag=%d", state, flag);
   return state;
 }
 
@@ -1100,9 +1075,57 @@ void loop() {
   if (xSemaphoreTake(beacon_sem, pdMS_TO_TICKS(2)) == pdTRUE) {
     // Semaphore received - it's time to send control data
 
-    // Calculate slot start time
-    int64_t slot_start_us = epoch_next_us - TDMA_BEACON_ADVANCE_US + (TDMA_DEVICE_ID * TDMA_SLOT_US);
+    // IMPORTANT: Do all checks BEFORE timing-critical section
+    // Check if drone is available before sending (prevent queue overflow)
+    if (!drone_available) {
+      // Check if it's time to retry
+      uint32_t current_time_ms = millis();
+      if (current_time_ms - drone_offline_time_ms >= DRONE_RETRY_INTERVAL_MS) {
+        // Time to retry - reset drone_available
+        drone_available = true;
+        drone_consecutive_failures = 0;
+        ESP_LOGI(TAG_DRONE, "Retrying drone transmission (offline for %u ms)...",
+                 current_time_ms - drone_offline_time_ms);
+      } else {
+        // Still in offline pause period - skip transmission
+        static uint32_t skip_log_count = 0;
+        skip_log_count++;
+        if (skip_log_count % 100 == 1) {
+          ESP_LOGD(TAG_DRONE, "Skipping drone send (offline) #%u, will retry in %u ms",
+                   skip_log_count, DRONE_RETRY_INTERVAL_MS - (current_time_ms - drone_offline_time_ms));
+        }
+        return;  // Early return - don't send to offline drone
+      }
+    }
+
+    // Check if drone peer exists before sending
+    static uint32_t peer_check_fail_count = 0;
+    if (!esp_now_is_peer_exist(dronePeer.peer_addr)) {
+      peer_check_fail_count++;
+      if (peer_check_fail_count % 100 == 1) {  // Log first occurrence and every 100th
+        ESP_LOGW(TAG_PEER, "Drone peer not found! Re-registering... (count=%u)", peer_check_fail_count);
+      }
+      drone_peer_init();  // Re-register drone peer
+    }
+
+    // Calculate slot start time (simplified - no reverse calculation needed!)
+    // frame_start_time_us = Timer fire time (master) or Beacon RX time (slave)
+    // TDMA_BEACON_ADVANCE_US = 800us (beacon sent before slot 0)
+    // Slot 0 starts at: frame_start_time_us + 800us
+    // Our slot starts at: Slot 0 + (DEVICE_ID * 1000us)
+    int64_t semaphore_acquired_time = esp_timer_get_time();  // Record when semaphore was acquired
+    int64_t slot_0_start_us = frame_start_time_us + TDMA_BEACON_ADVANCE_US;
+    int64_t slot_start_us = slot_0_start_us + (TDMA_DEVICE_ID * TDMA_SLOT_US);
     int64_t current_us = esp_timer_get_time();
+
+    // Debug: Log timing calculations (first 20 frames)
+    static uint32_t timing_debug_count = 0;
+    timing_debug_count++;
+    if (timing_debug_count <= 20) {
+      ESP_LOGI(TAG_TDMA, "Frame #%u: sem_acq=%lld, frame_start=%lld, slot_start=%lld, current=%lld, diff=%lld",
+               timing_debug_count, semaphore_acquired_time, frame_start_time_us,
+               slot_start_us, current_us, slot_start_us - current_us);
+    }
 
     // Precise microsecond timing for TDMA slot synchronization
     if (slot_start_us > current_us) {
@@ -1117,57 +1140,47 @@ void loop() {
       while (esp_timer_get_time() < slot_start_us) {
         // Busy wait for ultimate precision
       }
-    }
-
-    // Check if drone is available before sending (prevent queue overflow)
-    if (!drone_available) {
-      // Skip sending to offline drone to prevent queue overflow
-      // Beacon transmission will not be affected
-      return;  // Early return - don't send to offline drone
-    }
-
-    // Check if drone peer exists before sending
-    static uint32_t peer_check_fail_count = 0;
-    if (!esp_now_is_peer_exist(dronePeer.peer_addr)) {
-      peer_check_fail_count++;
-      if (peer_check_fail_count % 100 == 1) {  // Log first occurrence and every 100th
-        USBSerial.printf("Drone peer not found! Re-registering... (count=%u)\n", peer_check_fail_count);
+    } else {
+      // Slot start time is in the past - this is a timing error!
+      static uint32_t late_count = 0;
+      late_count++;
+      if (late_count <= 20 || late_count % 100 == 0) {
+        ESP_LOGW(TAG_TDMA, "Slot start missed #%u! slot_start was %lld us ago (sem_acq_delay=%lld us)",
+                 late_count, current_us - slot_start_us, semaphore_acquired_time - frame_start_time_us);
       }
-      drone_peer_init();  // Re-register drone peer
     }
 
-    // Send control data in our assigned slot
+    // Send control data in our assigned slot (immediately after timing wait)
+    int64_t actual_send_time = esp_timer_get_time();
     esp_err_t result = esp_now_send(dronePeer.peer_addr, senddata, sizeof(senddata));
-  } else {
-    // Timeout - send anyway (fallback for non-TDMA mode)
 
-    // Check if drone is available before sending (prevent queue overflow)
-    if (!drone_available) {
-      // Skip sending to offline drone to prevent queue overflow
-      return;  // Early return - don't send to offline drone
+    // Log send result for debugging (controlled by ESP_LOG level)
+    static uint32_t send_count = 0;
+    send_count++;
+    if (result != ESP_OK) {
+      ESP_LOGE(TAG_DRONE, "Send FAILED #%u: err=%d (MAC=%02X:%02X)",
+               send_count, result, dronePeer.peer_addr[4], dronePeer.peer_addr[5]);
+    } else if (send_count <= 20 || send_count % 100 == 0) {
+      // Log timing for first 20 sends to debug slot timing
+      int64_t timing_error = actual_send_time - slot_start_us;
+      ESP_LOGD(TAG_DRONE, "Send OK #%u (MAC=%02X:%02X) slot_err=%lld us | CB: ok=%u fail=%u",
+               send_count, dronePeer.peer_addr[4], dronePeer.peer_addr[5], timing_error,
+               drone_cb_success, drone_cb_fail);
     }
-
-    // Check if drone peer exists before sending
-    static uint32_t peer_check_fail_count_fallback = 0;
-    if (!esp_now_is_peer_exist(dronePeer.peer_addr)) {
-      peer_check_fail_count_fallback++;
-      if (peer_check_fail_count_fallback % 100 == 1) {
-        USBSerial.printf("Drone peer not found (fallback)! Re-registering... (count=%u)\n", peer_check_fail_count_fallback);
-      }
-      drone_peer_init();
-    }
-
-    esp_err_t result = esp_now_send(dronePeer.peer_addr, senddata, sizeof(senddata));
   }
+  // TDMA mode: No fallback transmission
+  // If semaphore is not available, skip this frame (don't send)
   #ifdef DEBUG
-  USBSerial.printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
-    dronePeer.peer_addr[0],
-    dronePeer.peer_addr[1],
-    dronePeer.peer_addr[2],
-    dronePeer.peer_addr[3],
-    dronePeer.peer_addr[4],
-    dronePeer.peer_addr[5]);
+  ESP_LOGD(TAG_DRONE, "Drone MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+           dronePeer.peer_addr[0],
+           dronePeer.peer_addr[1],
+           dronePeer.peer_addr[2],
+           dronePeer.peer_addr[3],
+           dronePeer.peer_addr[4],
+           dronePeer.peer_addr[5]);
   #endif
+
+  
   //Display information
   //float vbat =0.0;// M5.Axp.GetBatVoltage();
   //int8_t bat_charge_p = int8_t((vbat - 3.0) / 1.2 * 100);
@@ -1209,12 +1222,12 @@ void loop() {
         if (first_beacon_received) {
           int64_t time_since_beacon = esp_timer_get_time() - last_beacon_time_us;
           if (time_since_beacon > BEACON_TIMEOUT_US) {
-            M5.Lcd.printf("Freq:%4d LOST!  ", 1000000/dtime);
+            M5.Lcd.printf("F:%3d LOST!  ", 1000000/dtime);
           } else {
-            M5.Lcd.printf("Freq:%4d E:%+4d", 1000000/dtime, (int)pll_error_us);
+            M5.Lcd.printf("F:%3d E:%+4d  ", 1000000/dtime, (int)pll_error_us);
           }
         } else {
-          M5.Lcd.printf("Freq:%4d WAIT   ", 1000000/dtime);
+          M5.Lcd.printf("F:%3d WAIT   ", 1000000/dtime);
         }
       #endif
       break;
