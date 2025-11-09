@@ -65,6 +65,53 @@
 ### テレメトリ機能
 Atom JoyStickのATOMS3のUSB-CポートにPCからケーブルを接続すると、Joyのスイッチを入れなくても給電され動作します。その際にPC側でお好きなシリアル通信端末（例えばPlatformIOのシリアルモニタ）を開くと機体の各種情報がリアルタイムに流れます。これを保存することでログが取れます。
 
+### TDMA多機同時運用機能
+このコントローラーは、TDMA（時分割多重アクセス）方式により、最大10台のコントローラー/機体を同時に運用できます。
+
+#### システム構成
+- **デバイスID**: 0〜9の10台をサポート（ID=0が親機、ID=1〜9が子機）
+- **WiFiチャンネル**: チャンネル1固定（main.cpp内の`CHANNEL`定義で変更可能）
+- **制御周波数**: 50Hz（20ms周期）
+- **タイムスロット**: 各デバイスに2msのスロットを割り当て
+
+#### デバイスID設定方法
+各コントローラーに異なるIDを割り当てる必要があります：
+1. `src/main.cpp`の`TDMA_DEVICE_ID`定義を編集（56行目付近）
+2. 親機（マスター）は必ず`#define TDMA_DEVICE_ID 0`に設定
+3. 子機（スレーブ）は`#define TDMA_DEVICE_ID 1`〜`9`に設定
+4. ビルド＆アップロードして各コントローラーに書き込む
+
+#### LCD画面表示
+液晶画面の下部に以下の情報が表示されます：
+- **親機（ID=0）**: `Freq:50 M[counter]` - M=マスター、実測周波数と送信カウンタ
+- **子機（ID=1〜9）**: `F:50 E:±error` - 実測周波数と同期誤差（マイクロ秒）
+- **ビーコン喪失時**: `F:50 LOST!` - 親機からのビーコンが受信できない状態
+
+#### ビープ音による状態識別
+コントローラーは異なる周波数とパターンのビープ音で状態を通知します：
+
+1. **ビーコン喪失** - 4000Hz シングルビープ（500ms毎）
+   - 意味: 親機からのビーコンが受信できない（緊急度：高）
+   - 対処: 親機の電源を確認、または距離を近づける
+
+2. **スロットタイミングエラー** - 3000Hz ダブルビープ（100回に1回）
+   - 意味: 割り当てられた時間スロットに間に合わなかった
+   - 対処: 通常は自動回復。頻発する場合はログを確認
+
+3. **ドローンオフライン** - 1000Hz ロングビープ（100回に1回）
+   - 意味: StampFlyとのESP-NOW接続が失われた
+   - 対処: StampFlyの電源を確認、ペアリングをやり直す
+
+4. **Mutexタイムアウト** - 2000Hz トリプルビープ（100回に1回）
+   - 意味: 内部タスク間のデータ競合が発生（まれ）
+   - 対処: 通常は自動回復。頻発する場合は再起動
+
+#### 5台以上での運用時の注意
+- タイムスロットは2ms、制御周波数は50Hzに設定済み（5台以上の安定運用向け）
+- WiFi混雑環境では干渉が発生する可能性があります
+- 親機と子機の距離は5m以内を推奨
+- 全ての機体を同時に飛行させる場合、十分な空間を確保してください
+
 
 # StampFly Operation Manual
 
@@ -141,5 +188,52 @@ When flying for the first time, perform pairing.
 - If a significant impact occurs, the motors will automatically stop.
 
 ### Telemetry Function
-When you connect a cable from your PC to the USB-C port of the ATOMS3 on the Atom JoyStick, it will be powered and operate without needing to turn on the switch. During this time, if you open your preferred serial communication terminal on the PC (e.g., PlatformIO’s Serial Monitor), various real-time information about the device will be displayed. You can save this data to log it.
+When you connect a cable from your PC to the USB-C port of the ATOMS3 on the Atom JoyStick, it will be powered and operate without needing to turn on the switch. During this time, if you open your preferred serial communication terminal on the PC (e.g., PlatformIO's Serial Monitor), various real-time information about the device will be displayed. You can save this data to log it.
+
+### TDMA Multi-Unit Simultaneous Operation
+This controller supports up to 10 simultaneous controllers/drones using TDMA (Time Division Multiple Access) technology.
+
+#### System Configuration
+- **Device ID**: Supports 10 units (ID=0 is master, ID=1-9 are slaves)
+- **WiFi Channel**: Fixed to channel 1 (configurable via `CHANNEL` definition in main.cpp)
+- **Control Frequency**: 50Hz (20ms period)
+- **Time Slots**: 2ms slot allocated to each device
+
+#### Device ID Configuration
+Each controller must be assigned a unique ID:
+1. Edit the `TDMA_DEVICE_ID` definition in `src/main.cpp` (around line 56)
+2. Master device must be set to `#define TDMA_DEVICE_ID 0`
+3. Slave devices should be set to `#define TDMA_DEVICE_ID 1` through `9`
+4. Build and upload to each controller
+
+#### LCD Display Information
+The bottom of the LCD screen displays the following:
+- **Master (ID=0)**: `Freq:50 M[counter]` - M=Master, measured frequency and transmission counter
+- **Slave (ID=1-9)**: `F:50 E:±error` - Measured frequency and synchronization error (microseconds)
+- **Beacon Lost**: `F:50 LOST!` - Unable to receive beacon from master
+
+#### Error Identification via Beep Sounds
+The controller uses different beep frequencies and patterns to indicate various states:
+
+1. **Beacon Loss** - 4000Hz single beep (every 500ms)
+   - Meaning: Unable to receive beacon from master (high urgency)
+   - Solution: Check master power or move closer
+
+2. **Slot Timing Error** - 3000Hz double beep (every 100 occurrences)
+   - Meaning: Missed assigned time slot
+   - Solution: Usually auto-recovers. Check logs if frequent
+
+3. **Drone Offline** - 1000Hz long beep (every 100 occurrences)
+   - Meaning: Lost ESP-NOW connection with StampFly
+   - Solution: Check StampFly power or re-pair
+
+4. **Mutex Timeout** - 2000Hz triple beep (every 100 occurrences)
+   - Meaning: Internal task data contention (rare)
+   - Solution: Usually auto-recovers. Restart if frequent
+
+#### Precautions for 5+ Unit Operation
+- Time slots are set to 2ms and control frequency to 50Hz (optimized for 5+ stable operation)
+- Interference may occur in congested WiFi environments
+- Recommended distance between master and slaves: within 5m
+- Ensure adequate space when flying multiple drones simultaneously
 

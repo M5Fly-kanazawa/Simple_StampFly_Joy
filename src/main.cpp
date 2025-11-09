@@ -38,7 +38,7 @@ static const char* TAG_PEER = "PEER";
 
 // Global log level control (set at compile time)
 // ESP_LOG_NONE, ESP_LOG_ERROR, ESP_LOG_WARN, ESP_LOG_INFO, ESP_LOG_DEBUG, ESP_LOG_VERBOSE
-#define GLOBAL_LOG_LEVEL ESP_LOG_DEBUG  // Change this to control verbosity
+#define GLOBAL_LOG_LEVEL ESP_LOG_INFO  // Change this to control verbosity
 #include <M5AtomS3.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -53,11 +53,11 @@ static const char* TAG_PEER = "PEER";
 #define CHANNEL 1
 
 // TDMA Settings
-#define TDMA_DEVICE_ID 1         // Device ID: 0=Master, 1-9=Slave (manual setting)
-#define TDMA_FRAME_US 10000      // 1 frame = 10ms
-#define TDMA_SLOT_US 1000        // 1 slot = 1ms
+#define TDMA_DEVICE_ID 0         // Device ID: 0=Master, 1-9=Slave (manual setting)
+#define TDMA_FRAME_US 20000      // 1 frame = 20ms (extended for 5+ devices)
+#define TDMA_SLOT_US 2000        // 1 slot = 2ms (maximum margin for collision avoidance)
 #define TDMA_NUM_SLOTS 10        // 10 slots per frame
-#define TDMA_BEACON_ADVANCE_US 250  // Beacon fires 250us before slot 0 start
+#define TDMA_BEACON_ADVANCE_US 500  // Beacon fires 500us before slot 0 start (extended for better separation)
 
 #define ANGLECONTROL 0
 #define RATECONTROL 1
@@ -130,6 +130,24 @@ static const uint32_t BEACON_TIMEOUT_US = 50000;    // 50ms = 5 frames
 static TaskHandle_t tdma_send_task_handle = NULL;  // Task handle for TDMA transmission
 static uint8_t shared_senddata[14];                 // Shared buffer for TDMA packet
 static SemaphoreHandle_t senddata_mutex = NULL;     // Mutex to protect shared_senddata
+
+// Input Task (Phase 2: Sensor reading separation)
+static TaskHandle_t input_task_handle = NULL;      // Task handle for input processing
+static SemaphoreHandle_t input_mutex = NULL;        // Mutex to protect shared_inputdata
+struct InputData {
+    int16_t throttle_raw;     // Raw joystick values
+    int16_t phi_raw;
+    int16_t theta_raw;
+    int16_t psi_raw;
+    bool btn_pressed;         // Button state
+    bool btn_long_pressed;
+    uint8_t mode_changed;     // Mode change flags
+    uint8_t alt_mode_changed;
+};
+static struct InputData shared_inputdata = {0};
+
+// Actual TDMA transmission frequency (measured from send intervals)
+static volatile uint32_t actual_send_freq_hz = 0;
 
 // Function declarations
 void wifi_esp_now_init(void);
@@ -295,7 +313,12 @@ void tdma_send_task(void *pvParameters) {
                 xSemaphoreGive(senddata_mutex);
             } else {
                 // Mutex timeout - skip this frame
-                ESP_LOGW(TAG_TDMA, "Mutex timeout - skipping frame");
+                static uint32_t mutex_timeout_count = 0;
+                mutex_timeout_count++;
+                if (mutex_timeout_count % 100 == 1) {
+                    ESP_LOGW(TAG_TDMA, "Mutex timeout - skipping frame #%u", mutex_timeout_count);
+                    beep_mutex_timeout();  // 2000Hz triple beep = mutex timeout
+                }
                 continue;
             }
 
@@ -327,6 +350,7 @@ void tdma_send_task(void *pvParameters) {
                 peer_check_fail_count++;
                 if (peer_check_fail_count % 100 == 1) {  // Log first occurrence and every 100th
                     ESP_LOGW(TAG_PEER, "Drone peer not found! Re-registering... (count=%u)", peer_check_fail_count);
+                    beep_drone_offline();  // 1000Hz low tone = drone offline
                 }
                 drone_peer_init();  // Re-register drone peer
             }
@@ -345,7 +369,7 @@ void tdma_send_task(void *pvParameters) {
             static uint32_t timing_debug_count = 0;
             timing_debug_count++;
             if (timing_debug_count <= 20) {
-                ESP_LOGI(TAG_TDMA, "Frame #%u: sem_acq=%lld, frame_start=%lld, slot_start=%lld, current=%lld, diff=%lld",
+                ESP_LOGD(TAG_TDMA, "Frame #%u: sem_acq=%lld, frame_start=%lld, slot_start=%lld, current=%lld, diff=%lld",
                          timing_debug_count, semaphore_acquired_time, frame_start_time_us,
                          slot_start_us, current_us, slot_start_us - current_us);
             }
@@ -370,12 +394,25 @@ void tdma_send_task(void *pvParameters) {
                 if (late_count <= 20 || late_count % 100 == 0) {
                     ESP_LOGW(TAG_TDMA, "Slot start missed #%u! slot_start was %lld us ago (sem_acq_delay=%lld us)",
                              late_count, current_us - slot_start_us, semaphore_acquired_time - frame_start_time_us);
+                    if (late_count % 100 == 0) {
+                        beep_slot_error();  // 3000Hz double beep = slot timing error
+                    }
                 }
             }
 
             // Send control data in our assigned slot (immediately after timing wait)
             int64_t actual_send_time = esp_timer_get_time();
             esp_err_t result = esp_now_send(dronePeer.peer_addr, local_senddata, sizeof(local_senddata));
+
+            // Calculate actual transmission frequency from measured send intervals
+            static int64_t last_send_time_us = 0;
+            if (last_send_time_us > 0) {
+                int64_t interval_us = actual_send_time - last_send_time_us;
+                if (interval_us > 0) {
+                    actual_send_freq_hz = 1000000 / interval_us;
+                }
+            }
+            last_send_time_us = actual_send_time;
 
             // Log send result for debugging (controlled by ESP_LOG level)
             static uint32_t send_count = 0;
@@ -390,6 +427,65 @@ void tdma_send_task(void *pvParameters) {
                          send_count, dronePeer.peer_addr[4], dronePeer.peer_addr[5], timing_error,
                          drone_cb_success, drone_cb_fail);
             }
+        }
+    }
+}
+
+// Input Task (Phase 2: Dedicated task for sensor reading)
+// This task reads joystick and button inputs at 100Hz (10ms period)
+// Priority: High (but lower than TDMA tasks) for responsive input
+void input_task(void *pvParameters) {
+    static const char* TAG_INPUT = "INPUT";
+    ESP_LOGI(TAG_INPUT, "Input Task started");
+
+    const TickType_t xFrequency = pdMS_TO_TICKS(10);  // 100Hz = 10ms period
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    // Local variables for input processing
+    struct InputData local_input;
+    static uint32_t task_count = 0;
+
+    for(;;) {
+        // Wait for the next cycle (100Hz)
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        task_count++;
+
+        // Update M5 button state and joystick
+        M5.update();
+        joy_update();
+
+        // Read raw joystick values
+        local_input.throttle_raw = getThrottle();
+        local_input.phi_raw = getAileron();
+        local_input.theta_raw = getElevator();
+        local_input.psi_raw = getRudder();
+
+        // Read button states
+        local_input.btn_pressed = M5.Btn.wasPressed();
+        local_input.btn_long_pressed = M5.Btn.pressedFor(400);
+
+        // Check mode button changes (these functions use getModeButton/getOptionButton internally)
+        local_input.mode_changed = check_control_mode_change();
+        local_input.alt_mode_changed = check_alt_mode_change();
+
+        // Update shared buffer with mutex protection
+        if (xSemaphoreTake(input_mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+            memcpy(&shared_inputdata, &local_input, sizeof(InputData));
+            xSemaphoreGive(input_mutex);
+        } else {
+            // Mutex timeout - should be rare
+            static uint32_t mutex_timeout_count = 0;
+            mutex_timeout_count++;
+            if (mutex_timeout_count % 100 == 1) {
+                ESP_LOGW(TAG_INPUT, "Mutex timeout #%u", mutex_timeout_count);
+                beep_mutex_timeout();  // 2000Hz triple beep = mutex timeout
+            }
+        }
+
+        // Log task health (every 1 second = 100 cycles)
+        if (task_count % 100 == 0) {
+            ESP_LOGD(TAG_INPUT, "Input task healthy: count=%u, throttle=%d, phi=%d",
+                     task_count, local_input.throttle_raw, local_input.phi_raw);
         }
     }
 }
@@ -1026,6 +1122,32 @@ void setup() {
     ESP_LOGI(TAG_TDMA, "TDMA send task created (handle=%p)", tdma_send_task_handle);
   }
 
+  // Create input mutex for shared input data protection
+  input_mutex = xSemaphoreCreateMutex();
+  if (input_mutex == NULL) {
+    ESP_LOGE(TAG_MAIN, "Failed to create input mutex");
+  } else {
+    ESP_LOGI(TAG_MAIN, "Input mutex created");
+  }
+
+  // Create input task (Phase 2: Sensor reading separation)
+  BaseType_t input_task_result = xTaskCreatePinnedToCore(
+      input_task,                  // Task function
+      "InputTask",                 // Task name
+      4096,                        // Stack size (bytes)
+      NULL,                        // Task parameter
+      configMAX_PRIORITIES - 2,    // High priority (lower than TDMA)
+      &input_task_handle,          // Task handle
+      1                            // Core 1 (same as loop)
+  );
+
+  if (input_task_result != pdPASS) {
+    ESP_LOGE(TAG_MAIN, "Failed to create input task");
+    input_task_handle = NULL;
+  } else {
+    ESP_LOGI(TAG_MAIN, "Input task created (handle=%p)", input_task_handle);
+  }
+
   // Wait for system stabilization before starting TDMA timer
   // This prevents transient timing errors during system startup
   ESP_LOGI(TAG_TDMA, "Waiting for system stabilization (200ms)...");
@@ -1044,6 +1166,16 @@ void setup() {
   }
 
   ESP_LOGI(TAG_TDMA, "TDMA initialized. Device ID=%d, Channel=%d", TDMA_DEVICE_ID, CHANNEL);
+
+  // Set runtime log levels to INFO (disable DEBUG output to avoid timing delays)
+  esp_log_level_set("*", GLOBAL_LOG_LEVEL);           // Default for all tags
+  esp_log_level_set("TDMA", GLOBAL_LOG_LEVEL);
+  esp_log_level_set("DRONE", GLOBAL_LOG_LEVEL);
+  esp_log_level_set("INPUT", GLOBAL_LOG_LEVEL);
+  esp_log_level_set("MAIN", GLOBAL_LOG_LEVEL);
+  esp_log_level_set("BEACON", GLOBAL_LOG_LEVEL);
+  esp_log_level_set("PEER", GLOBAL_LOG_LEVEL);
+  ESP_LOGI(TAG_MAIN, "Log level set to %s", GLOBAL_LOG_LEVEL == ESP_LOG_INFO ? "INFO" : "DEBUG");
 }
 
 uint8_t check_control_mode_change(void)
@@ -1097,31 +1229,46 @@ uint8_t check_alt_mode_change(void)
 uint8_t average_counter = 0;
 
 void loop() {
-  int16_t _throttle;// = getThrottle();
-  int16_t _phi;// = getAileron();
-  int16_t _theta;// = getElevator();
-  int16_t _psi;// = getRudder();
+  int16_t _throttle;
+  int16_t _phi;
+  int16_t _theta;
+  int16_t _psi;
   static uint8_t loop_counter = 0;
 
   // ============================================================================
-  // Loop processing: Read sensors, prepare control data for TDMA task
+  // Loop processing: Read input data from input_task, prepare control data for TDMA task
+  // Input reading is handled by dedicated task (input_task)
   // TDMA transmission is handled by dedicated task (tdma_send_task)
   // ============================================================================
   etime = stime;
   stime = micros();
   dtime = stime - etime;
   loop_counter++;
-  M5.update();
-  joy_update();
 
-  //Stop Watch Start&Stop&Reset  
-  if(M5.Btn.wasPressed()==true)
+  // Read input data from shared buffer (mutex-protected)
+  struct InputData local_input;
+  if (xSemaphoreTake(input_mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+    memcpy(&local_input, &shared_inputdata, sizeof(InputData));
+    xSemaphoreGive(input_mutex);
+  } else {
+    // Mutex timeout - use previous values (or zero)
+    static uint32_t loop_mutex_timeout_count = 0;
+    loop_mutex_timeout_count++;
+    if (loop_mutex_timeout_count % 100 == 1) {
+      ESP_LOGW(TAG_MAIN, "Input mutex timeout in loop() #%u", loop_mutex_timeout_count);
+      beep_mutex_timeout();  // 2000Hz triple beep = mutex timeout
+    }
+    memset(&local_input, 0, sizeof(InputData));
+  }
+
+  // Process button events from input task
+  if(local_input.btn_pressed == true)
   {
     if (Timer_state == 0)Timer_state = 1;
     else if (Timer_state == 1)Timer_state = 0;
   }
 
-  if(M5.Btn.pressedFor(400)==true)
+  if(local_input.btn_long_pressed == true)
   {
     Timer_state = 2;
   }
@@ -1138,22 +1285,24 @@ void loop() {
     Timer_state = 0;
   }
 
-  if (check_control_mode_change() == 1)
+  // Process mode changes from input task
+  if (local_input.mode_changed == 1)
   {
     if (Mode==ANGLECONTROL)Mode=RATECONTROL;
     else Mode = ANGLECONTROL;
   }
 
-  if (check_alt_mode_change() == 1)
+  if (local_input.alt_mode_changed == 1)
   {
     if (AltMode==ALT_CONTROL_MODE)AltMode=NOT_ALT_CONTROL_MODE;
     else AltMode = ALT_CONTROL_MODE;
   }
 
-  _throttle = getThrottle();
-  _phi = getAileron();
-  _theta = getElevator();
-  _psi = getRudder();
+  // Use raw values from input task
+  _throttle = local_input.throttle_raw;
+  _phi = local_input.phi_raw;
+  _theta = local_input.theta_raw;
+  _psi = local_input.psi_raw;
 
   if(average_counter<50)
   {
@@ -1249,6 +1398,7 @@ void loop() {
     mutex_timeout_count++;
     if (mutex_timeout_count % 100 == 1) {
       ESP_LOGW(TAG_TDMA, "Mutex timeout in loop() #%u", mutex_timeout_count);
+      beep_mutex_timeout();  // 2000Hz triple beep = mutex timeout
     }
   }
 
@@ -1257,10 +1407,10 @@ void loop() {
   if (TDMA_DEVICE_ID != 0 && first_beacon_received) {
     int64_t time_since_beacon = esp_timer_get_time() - last_beacon_time_us;
     if (time_since_beacon > BEACON_TIMEOUT_US) {
-      // Beacon lost - beep every 500ms
+      // Beacon lost - beep every 500ms (4000Hz high pitch = urgent)
       uint32_t current_millis = millis();
       if (current_millis - last_beep_time >= 500) {
-        beep();
+        beep_beacon_loss();
         last_beep_time = current_millis;
       }
     }
@@ -1300,7 +1450,7 @@ void loop() {
       #endif
       break;
     case 3:
-      M5.Lcd.printf("CHL: %02d",dronePeer.channel);
+      M5.Lcd.printf("CH: %02d ID: %d  ",dronePeer.channel, TDMA_DEVICE_ID);
       break;
     case 4:
       if( AltMode == ALT_CONTROL_MODE ) M5.Lcd.printf("-Auto ALT-  ");
@@ -1313,23 +1463,21 @@ void loop() {
     case 6:
       //M5.Lcd.printf("Time:%7.2f",Timer);
       #if TDMA_DEVICE_ID == 0
-        // Master device - show frequency and role
-        M5.Lcd.printf("Freq:%4d M[%3d]", 1000000/dtime, loop_counter);
+        // Master device - show actual measured transmission frequency and role
+        M5.Lcd.printf("Freq:%4d M[%3d]", (int)actual_send_freq_hz, loop_counter);
       #else
-        // Slave device - show frequency and PLL sync error or beacon loss
+        // Slave device - show actual measured transmission frequency and PLL sync error or beacon loss
         if (first_beacon_received) {
           int64_t time_since_beacon = esp_timer_get_time() - last_beacon_time_us;
           if (time_since_beacon > BEACON_TIMEOUT_US) {
-            M5.Lcd.printf("F:%3d LOST!  ", 1000000/dtime);
+            M5.Lcd.printf("F:%4d LOST!  ", (int)actual_send_freq_hz);
           } else {
-            M5.Lcd.printf("F:%3d E:%+4d  ", 1000000/dtime, (int)pll_error_us);
+            M5.Lcd.printf("F:%4d E:%+4d  ", (int)actual_send_freq_hz, (int)pll_error_us);
           }
         } else {
-          M5.Lcd.printf("F:%3d WAIT   ", 1000000/dtime);
+          M5.Lcd.printf("F:%4d WAIT   ", (int)actual_send_freq_hz);
         }
       #endif
-      break;
-    case 7:
       break;
     case 8:
       break;

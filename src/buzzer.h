@@ -19,4 +19,10 @@ void beep(void);
 void start_tone(void);
 void buzzer_sound(uint32_t frequency, uint32_t duration_ms);
 
+// Different beep patterns for error identification
+void beep_beacon_loss(void);      // 4000Hz single beep (urgent)
+void beep_slot_error(void);       // 3000Hz double beep
+void beep_drone_offline(void);    // 1000Hz long beep (low tone)
+void beep_mutex_timeout(void);    // 2000Hz triple beep
+
 #endif

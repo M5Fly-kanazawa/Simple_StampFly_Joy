@@ -41,3 +41,31 @@ void start_tone(void) {
     buzzer_sound(NOTE_D4, 200);
     #endif
 }
+
+// Different beep patterns for error identification
+
+// Beacon loss: Single high-pitched beep (urgent warning)
+void beep_beacon_loss(void) {
+    buzzer_sound(4000, 100);
+}
+
+// Slot timing error: Double medium-high beep
+void beep_slot_error(void) {
+    buzzer_sound(3000, 80);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    buzzer_sound(3000, 80);
+}
+
+// Drone offline: Single long low-pitched beep
+void beep_drone_offline(void) {
+    buzzer_sound(1000, 300);
+}
+
+// Mutex timeout: Triple medium beep (rapid pattern)
+void beep_mutex_timeout(void) {
+    buzzer_sound(2000, 60);
+    vTaskDelay(40 / portTICK_PERIOD_MS);
+    buzzer_sound(2000, 60);
+    vTaskDelay(40 / portTICK_PERIOD_MS);
+    buzzer_sound(2000, 60);
+}
