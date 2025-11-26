@@ -9,20 +9,20 @@
 ### タイミング構造
 
 ```
-フレーム（10ms）
-├─ ビーコン（親機のみ送信、フレーム開始250μs前）
-├─ スロット0（1ms）親機の制御データ送信
-├─ スロット1（1ms）子機ID=1の制御データ送信
-├─ スロット2（1ms）子機ID=2の制御データ送信
+フレーム（20ms）
+├─ ビーコン（親機のみ送信、フレーム開始500μs前）
+├─ スロット0（2ms）親機の制御データ送信
+├─ スロット1（2ms）子機ID=1の制御データ送信
+├─ スロット2（2ms）子機ID=2の制御データ送信
 ├─ ...
-└─ スロット9（1ms）子機ID=9の制御データ送信
+└─ スロット9（2ms）子機ID=9の制御データ送信
 ```
 
 ### 動作原理
 
-1. **親機（ID=0）**: 自律的にビーコンを10ms周期で送信し、スロット0で制御データを送信
-2. **子機（ID=1-9）**: 親機のビーコンを受信してPLLで同期し、割り当てられたスロットで送信
-3. **PLL同期**: 位相誤差を検出して自動補正することで、長時間の同期を維持
+1. **親機（ID=0）**: 自律的にビーコンを20ms周期で送信し、スロット0で制御データを送信
+2. **子機（ID=1-9）**: 親機のビーコンを受信して同期し、割り当てられたスロットで送信
+3. **専用タスク**: TDMA送信は専用タスク（tdma_send_task）で処理され、高精度なタイミング制御を実現
 
 ---
 
@@ -34,7 +34,7 @@
 
 #### 設定箇所
 
-[src/main.cpp:44](src/main.cpp#L44)
+[src/main.cpp:56](src/main.cpp#L56)
 
 ```cpp
 #define TDMA_DEVICE_ID 0         // Device ID: 0=Master, 1-9=Slave (manual setting)
@@ -69,7 +69,7 @@
 
 #### 設定箇所
 
-[src/main.cpp:41](src/main.cpp#L41)
+[src/main.cpp:53](src/main.cpp#L53)
 
 ```cpp
 #define CHANNEL 1
@@ -89,20 +89,20 @@
 
 ### 3. TDMA詳細パラメータ（通常は変更不要）
 
-[src/main.cpp:45-48](src/main.cpp#L45-L48)
+[src/main.cpp:57-60](src/main.cpp#L57-L60)
 
 ```cpp
-#define TDMA_FRAME_US 10000          // 1フレーム = 10ms
-#define TDMA_SLOT_US 1000            // 1スロット = 1ms
+#define TDMA_FRAME_US 20000          // 1フレーム = 20ms（5台以上対応のため拡張）
+#define TDMA_SLOT_US 2000            // 1スロット = 2ms（衝突回避のため最大マージン）
 #define TDMA_NUM_SLOTS 10            // スロット数 = 10
-#define TDMA_BEACON_ADVANCE_US 250   // ビーコン先行時間 = 250μs
+#define TDMA_BEACON_ADVANCE_US 500   // ビーコン先行時間 = 500μs（分離向上のため拡張）
 ```
 
 **通常はこれらの値を変更する必要はありません。**
 
 ### 4. PLL同期パラメータ（上級者向け）
 
-[src/main.cpp:97-98](src/main.cpp#L97-L98)
+[src/main.cpp:121-122](src/main.cpp#L121-L122)
 
 ```cpp
 static const float PLL_KP = 0.1;     // 比例ゲイン
@@ -188,13 +188,13 @@ TDMA Slave initialized (ID=1)
 ```
 時刻 0ms: 親機がビーコン送信
          ↓
-時刻 0.25ms: フレーム開始
-時刻 0-1ms: 親機（ID=0）が制御データ送信
-時刻 1-2ms: 子機1（ID=1）が制御データ送信
-時刻 2-3ms: 子機2（ID=2）が制御データ送信
-時刻 3-10ms: 未使用スロット
+時刻 0.5ms: フレーム開始
+時刻 0-2ms: 親機（ID=0）が制御データ送信
+時刻 2-4ms: 子機1（ID=1）が制御データ送信
+時刻 4-6ms: 子機2（ID=2）が制御データ送信
+時刻 6-20ms: 未使用スロット
          ↓
-時刻 10ms: 次のフレーム開始（親機がビーコン送信）
+時刻 20ms: 次のフレーム開始（親機がビーコン送信）
 ```
 
 ---
@@ -204,14 +204,16 @@ TDMA Slave initialized (ID=1)
 ### Q1: 子機が同期しない
 
 **確認事項:**
-- 親機が正常に起動しているか（起動メッセージを確認）
-- チャンネルが親機と子機で一致しているか
-- ペアリングが完了しているか
+- 親機（ID=0）が正常に起動しているか（起動メッセージを確認）
+- チャンネル（CHANNEL）が親機と子機で一致しているか
+- 子機のディスプレイに「WAIT」または「LOST!」が表示されていないか
 
 **対処法:**
-1. すべてのデバイスを再起動
-2. シリアルモニタでエラーメッセージを確認
-3. PLL同期が動作しているかログで確認
+1. すべてのコントローラを再起動（親機を先に起動）
+2. シリアルモニタでビーコン受信ログを確認
+3. ビーコンロスト時は4000Hzのビープ音が鳴るので音を確認
+
+**注意:** TDMA同期はコントローラ間のビーコン同期であり、ドローンとのペアリングとは無関係です。
 
 ### Q2: 複数の親機を使いたい
 
@@ -228,23 +230,25 @@ TDMA Slave initialized (ID=1)
 
 ### Q4: 10台以上のコントローラを使いたい
 
-スロット数を増やす必要があります：
+現在のフレーム時間（20ms）とスロット時間（2ms）で最大10台まで対応しています。
+さらに多くのコントローラを使用する場合は、スロット数を増やす必要があります：
 
 ```cpp
-#define TDMA_FRAME_US 20000      // 20msに延長
+#define TDMA_FRAME_US 40000      // 40msに延長
 #define TDMA_NUM_SLOTS 20        // スロット数を20に増加
 ```
 
-ただし、フレーム時間が長くなると制御の遅延が増加します。
+ただし、フレーム時間が長くなると制御の遅延が増加します（現在は50Hz制御周期）。
 
 ### Q5: タイムアウトエラーが発生する
 
-```cpp
-// タイムアウト時間を延長（デフォルト20ms）
-if (xSemaphoreTake(beacon_sem, pdMS_TO_TICKS(50)) == pdTRUE) {
-```
+TDMA送信タスクはセマフォで待機しており、タイムアウトは発生しません（portMAX_DELAYで無限待機）。
+ただし、ビーコンロストの場合は50ms（5フレーム）でタイムアウト警告が表示されます。
 
-[src/main.cpp:638](src/main.cpp#L638) の値を調整してください。
+[src/main.cpp:127](src/main.cpp#L127)
+```cpp
+static const uint32_t BEACON_TIMEOUT_US = 50000;    // 50ms = 5 frames
+```
 
 ---
 
@@ -259,6 +263,16 @@ if (xSemaphoreTake(beacon_sem, pdMS_TO_TICKS(50)) == pdTRUE) {
 ```
 
 デバッグモードでは、送信先MACアドレスがシリアル出力されます。
+
+### ログレベルの変更
+
+[src/main.cpp:41](src/main.cpp#L41)
+
+```cpp
+#define GLOBAL_LOG_LEVEL ESP_LOG_INFO  // ESP_LOG_DEBUG で詳細ログ出力
+```
+
+ログレベルを`ESP_LOG_DEBUG`に変更すると、TDMA送信タイミングなどの詳細情報が出力されます。
 
 ### PLL同期状態の確認
 
@@ -316,12 +330,12 @@ USBSerial.printf("PLL error: %d us, integral: %d\n", pll_error_us, pll_integral)
 
 | 項目 | 値 |
 |-----|-----|
-| フレーム周期 | 10ms（100Hz） |
-| スロット幅 | 1ms |
+| フレーム周期 | 20ms（50Hz） |
+| スロット幅 | 2ms |
 | 最大同時接続数 | 10台 |
 | ビーコン送信タイミング精度 | ±数μs（esp_timer） |
-| PLL同期精度 | ±数十μs（定常状態） |
-| 送信遅延 | 最大10ms（自スロットまでの待ち時間） |
+| 同期精度 | ±数十μs（定常状態） |
+| 送信遅延 | 最大20ms（自スロットまでの待ち時間） |
 
 ---
 
@@ -345,10 +359,13 @@ USBSerial.printf("PLL error: %d us, integral: %d\n", pll_error_us, pll_integral)
 
 ### 主要関数
 
-- `beacon_timer_callback()` ([main.cpp:106](src/main.cpp#L106)) - ビーコンタイマー割り込み
-- `OnDataRecv()` ([main.cpp:129](src/main.cpp#L129)) - パケット受信コールバック
-- `setup()` ([main.cpp:441-473](src/main.cpp#L441-L473)) - TDMA初期化
-- `loop()` ([main.cpp:636-662](src/main.cpp#L636-L662)) - TDMA同期送信
+- `beacon_timer_callback()` ([main.cpp:503](src/main.cpp#L503)) - ビーコンタイマー割り込み
+- `beacon_task()` ([main.cpp:195](src/main.cpp#L195)) - ビーコン送信タスク（親機のみ）
+- `tdma_send_task()` ([main.cpp:296](src/main.cpp#L296)) - TDMA送信タスク（制御データ送信）
+- `input_task()` ([main.cpp:445](src/main.cpp#L445)) - 入力処理タスク（ジョイスティック読み取り）
+- `OnDataRecv()` ([main.cpp:628](src/main.cpp#L628)) - パケット受信コールバック
+- `setup()` ([main.cpp:977](src/main.cpp#L977)) - TDMA初期化
+- `loop()` ([main.cpp:1244](src/main.cpp#L1244)) - データ準備とディスプレイ更新
 
 ### 技術資料
 
@@ -367,4 +384,5 @@ Kouhei Ito - kouhei.ito@itolab-ktc.com
 
 ## 更新履歴
 
+- 2025-11-26: 5台以上対応（フレーム20ms、スロット2ms）、専用タスク分離、ビープ音識別機能追加
 - 2025-11-07: TDMA初版実装
