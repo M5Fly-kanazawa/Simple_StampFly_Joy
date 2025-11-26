@@ -183,6 +183,13 @@ static const uint32_t DRONE_FAILURE_THRESHOLD = 10;  // 10 consecutive failures 
 static volatile uint32_t drone_offline_time_ms = 0;  // Time when drone went offline
 static const uint32_t DRONE_RETRY_INTERVAL_MS = 5000;  // Retry every 5 seconds
 
+// Air time measurement (send start to callback)
+static volatile int64_t send_start_time_us = 0;
+static volatile int64_t min_air_time_us = INT64_MAX;
+static volatile int64_t max_air_time_us = 0;
+static volatile int64_t total_air_time_us = 0;
+static volatile uint32_t air_time_sample_count = 0;
+
 // Beacon transmission task (for master only)
 // This task waits for notification from timer ISR and sends beacon
 void beacon_task(void* parameter)
@@ -402,6 +409,7 @@ void tdma_send_task(void *pvParameters) {
 
             // Send control data in our assigned slot (immediately after timing wait)
             int64_t actual_send_time = esp_timer_get_time();
+            send_start_time_us = actual_send_time;  // Capture for air time measurement
             esp_err_t result = esp_now_send(dronePeer.peer_addr, local_senddata, sizeof(local_senddata));
 
             // Calculate actual transmission frequency from measured send intervals
@@ -541,10 +549,33 @@ float limit(float v, float vmin, float vmax)
 // 送信コールバック
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
+  // Capture callback time immediately for air time measurement
+  int64_t callback_time_us = esp_timer_get_time();
+
   // Check if this is beacon (FF:FF:FF:FF:FF:FF) or drone packet
   bool is_beacon = (mac_addr[0] == 0xFF && mac_addr[1] == 0xFF &&
                     mac_addr[2] == 0xFF && mac_addr[3] == 0xFF &&
                     mac_addr[4] == 0xFF && mac_addr[5] == 0xFF);
+
+  // Measure air time for drone packets (not beacons)
+  if (!is_beacon && send_start_time_us > 0) {
+    int64_t air_time_us = callback_time_us - send_start_time_us;
+
+    // Update statistics (only for successful sends)
+    if (status == ESP_NOW_SEND_SUCCESS && air_time_us > 0 && air_time_us < 10000) {
+      if (air_time_us < min_air_time_us) min_air_time_us = air_time_us;
+      if (air_time_us > max_air_time_us) max_air_time_us = air_time_us;
+      total_air_time_us += air_time_us;
+      air_time_sample_count++;
+
+      // Log statistics every 100 successful transmissions (DEBUG level)
+      if (air_time_sample_count % 100 == 0) {
+        int64_t avg_air_time_us = total_air_time_us / air_time_sample_count;
+        ESP_LOGD(TAG_DRONE, "AirTime Stats [n=%u]: min=%lld avg=%lld max=%lld us",
+                 air_time_sample_count, min_air_time_us, avg_air_time_us, max_air_time_us);
+      }
+    }
+  }
 
   // Track send statistics
   if (status == ESP_NOW_SEND_SUCCESS) {
@@ -1180,49 +1211,31 @@ void setup() {
 
 uint8_t check_control_mode_change(void)
 {
-  uint8_t state;
-  static uint8_t flag =0;
-  state = 0;
-  if (flag==0)
-  {
-    if (getModeButton() == 1)
-    {
-      flag = 1;
-    }
+  uint8_t state = 0;
+  static uint8_t button_state = 0;
+
+  if (getModeButton() == 1 && button_state == 0) {
+    state = 1;
+    button_state = 1;
+  } else if (getModeButton() == 0 && button_state == 1) {
+    button_state = 0;
   }
-  else
-  {
-    if (getModeButton() == 0)
-    {
-      flag = 0;
-      state = 1;
-    }
-  }
-  //ESP_LOGV(TAG_MAIN, "control_mode state=%d flag=%d", state, flag);
+
   return state;
 }
 
 uint8_t check_alt_mode_change(void)
 {
-  uint8_t state;
-  static uint8_t flag =0;
-  state = 0;
-  if (flag==0)
-  {
-    if (getOptionButton() == 1)
-    {
-      flag = 1;
-    }
+  uint8_t state = 0;
+  static uint8_t button_state = 0;
+
+  if (getOptionButton() == 1 && button_state == 0) {
+    state = 1;
+    button_state = 1;
+  } else if (getOptionButton() == 0 && button_state == 1) {
+    button_state = 0;
   }
-  else
-  {
-    if (getOptionButton() == 0)
-    {
-      flag = 0;
-      state = 1;
-    }
-  }
-  //ESP_LOGV(TAG_MAIN, "alt_mode state=%d flag=%d", state, flag);
+
   return state;
 }
 
@@ -1290,12 +1303,26 @@ void loop() {
   {
     if (Mode==ANGLECONTROL)Mode=RATECONTROL;
     else Mode = ANGLECONTROL;
+    ESP_LOGI(TAG_MAIN, "Mode toggled to: %s", Mode == ANGLECONTROL ? "STABILIZE" : "ACRO");
+
+    // Clear the flag after processing to prevent repeated toggling
+    if (xSemaphoreTake(input_mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+      shared_inputdata.mode_changed = 0;
+      xSemaphoreGive(input_mutex);
+    }
   }
 
   if (local_input.alt_mode_changed == 1)
   {
     if (AltMode==ALT_CONTROL_MODE)AltMode=NOT_ALT_CONTROL_MODE;
     else AltMode = ALT_CONTROL_MODE;
+    ESP_LOGI(TAG_MAIN, "AltMode toggled to: %s", AltMode == ALT_CONTROL_MODE ? "Auto ALT" : "Manual ALT");
+
+    // Clear the flag after processing to prevent repeated toggling
+    if (xSemaphoreTake(input_mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+      shared_inputdata.alt_mode_changed = 0;
+      xSemaphoreGive(input_mutex);
+    }
   }
 
   // Use raw values from input task
