@@ -2,7 +2,7 @@
 
 ## 概要
 
-このプログラムは、複数のStampFlyコントローラが同一チャンネルで干渉なく通信できるよう、TDMA（Time Division Multiple Access）方式を実装しています。
+このプログラムは、複数のStampFlyが同一チャンネルで干渉なく通信し操縦できるよう、TDMA（Time Division Multiple Access）方式を実装しています。
 
 ## TDMA方式の仕組み
 
