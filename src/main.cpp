@@ -1350,10 +1350,10 @@ void loop() {
   }
   else
   {
-    _throttle -= Throttle_bias;
-    _phi -= Phi_bias;
-    _theta -= Theta_bias;
-    _psi -= Psi_bias;
+    if(_throttle < Throttle_bias) _throttle=0; else _throttle -= Throttle_bias;
+    if(_phi < Phi_bias) _phi=0; else _phi -= Phi_bias;
+    if(_theta < Theta_bias) _theta=0; else _theta -= Theta_bias;
+    if(_psi < Psi_bias) _psi=0; else _psi -= Psi_bias;
   }
 
   //量産版
